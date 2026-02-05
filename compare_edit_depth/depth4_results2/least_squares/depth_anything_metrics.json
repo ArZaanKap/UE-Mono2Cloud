@@ -1,0 +1,14 @@
+{
+  "model": "depth_anything",
+  "scaling_method": "ls",
+  "scale": 0.01583840139210224,
+  "shift": 0.6528068780899048,
+  "n_unchanged": 1276115,
+  "n_changed": 33193,
+  "pct_unchanged": 97.46484402447705,
+  "pct_changed": 2.535155975522948,
+  "depth_min": 0.669969379901886,
+  "depth_max": 4.738613128662109,
+  "unchanged_match_gt": true,
+  "changed_match_pred": true
+}
