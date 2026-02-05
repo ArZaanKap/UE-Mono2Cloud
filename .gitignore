@@ -1,0 +1,13 @@
+# Models
+*.pt
+*.pth
+checkpoints/
+
+# Data and Results
+*.exr
+*.npy
+data/
+output/
+
+# Local Settings
+.claude/
