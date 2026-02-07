@@ -7,8 +7,10 @@ weights/
 # Data and Results
 *.exr
 *.npy
+*.las
 data/
 output/
+pointclouds/
 
 # Third-party repos
 Robust-Scene-Change-Detection/

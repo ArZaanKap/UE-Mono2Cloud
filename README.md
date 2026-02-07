@@ -1,70 +1,98 @@
 # UE Mono2Cloud
 
-**Turn AI-generated room concepts into 3D point clouds for Unreal Engine.**
-
-## What is this?
-
-DepthDreamer lets designers quickly visualize AI-generated interior concepts in 3D. Start with a half-finished room in Unreal Engine, use AI to "decorate" it, then bring that vision back into 3D space as a point cloud.
+Turn AI-edited room images into 3D point clouds using monocular depth estimation, calibrated against Unreal Engine ground truth.
 
 ## Workflow
 
 ```
-UE Scene (incomplete) → Export RGB + Depth
-                              ↓
-                     AI decorates the RGB
-                              ↓
-              Depth model estimates depth on both images
-                              ↓
-               Use GT depth to calibrate scale factor
-                              ↓
-              Apply scale to decorated depth output
-                              ↓
-                   Generate colored point cloud
-                              ↓
-                     Import back into UE
+UE Scene → Export RGB + GT Depth (EXR)
+                    ↓
+         AI edits the RGB image
+                    ↓
+      Detect changed regions (GeSCF / DINOv2)
+                    ↓
+      Run depth model on edited image
+                    ↓
+      Calibrate prediction → GT via unchanged regions
+                    ↓
+      Generate colored point cloud (.las)
 ```
 
-## Why?
+## Project Structure
 
-- **Fast iteration**: See AI concepts in 3D without manual modeling
-- **Spatial understanding**: Evaluate if AI suggestions work in the actual space
-- **Design exploration**: Quickly test multiple decoration styles in context
+| File | What it does |
+|------|--------------|
+| `img_to_pointcloud.ipynb` | End-to-end pipeline: change detection, depth estimation (Depth Pro), least-squares calibration, LAS export |
+| `compare_edit_depth/compare_edit_depth.py` | Evaluate depth consistency — runs model on original + edited image, scales from **original**, reports metrics on unchanged regions |
+| `compare_edit_depth/compare_edit_depth2.py` | Same evaluation but scales from **edited image** unchanged regions instead |
+| `compare_all_models.py` | Benchmark depth models (Depth Pro, Depth Anything V2, Metric3D v2) against GT |
+| `change_detection_results/test_change_detection.py` | Compare change detection methods: RGB threshold, DINOv2, GeSCF (SAM Q/K/V), DINOv2+CrossAttn |
+| `analyze_depth.py` | Inspect EXR depth files — verify channels, units, and `GT_TO_CENTIMETERS` |
 
-## Key Components
+## Depth Calibration
 
-| File | Purpose |
-|------|---------|
-| `img_to_pointcloud.ipynb` | Main pipeline: depth estimation → point cloud generation |
-| `compare_all_models.py` | Benchmark depth models (Depth Pro, ZoeDepth, Metric3D, Depth Anything) |
-| `analyze_depth.py` | Analyze UE depth exports and verify calibration |
+Monocular depth models output relative or coarsely-metric depth. We align predictions to UE ground truth using least-squares fitting on unchanged regions:
 
-## Depth Models Compared
+```
+depth_calibrated = prediction * scale + shift
+```
 
-| Model | RMSE | Best For |
-|-------|------|----------|
-| Depth Pro | 5.5cm | Production (best accuracy) |
-| ZoeDepth | 6.1cm | Good alternative |
-| Metric3D v2 | 6.8cm | Lightweight option |
-| Depth Anything V2 | 8.0cm | Fast inference |
+The change detection mask (GeSCF by default) identifies which pixels were not modified by the AI edit, so only those are used for fitting.
+
+## Metrics
+
+All evaluation scripts report metrics **in meters on unchanged regions**:
+
+| Metric | Description |
+|--------|-------------|
+| MAE | Mean absolute error between prediction and GT |
+| RMSE | Root mean square error (penalises large errors) |
+| Edit vs GT MAE | How well the edited prediction matches GT after scaling |
+| Orig vs GT MAE | Baseline — how well the original prediction matches GT |
+| % > 0.1m / 0.5m | Fraction of pixels with error above threshold |
+
+`compare_edit_depth` saves results to JSON + markdown tables per model. `img_to_pointcloud` prints MAE/RMSE to console only.
+
+## Data Layout
+
+```
+data/
+  depth3/                         # Test scene 1
+  depth4/                         # Test scene 2
+    HighresScreenshot00000.exr        # Original RGB (EXR, linear)
+    HighresScreenshot00000_SceneDepth.exr  # GT depth
+    *edit*.png                        # AI-edited image
+change_detection_results/
+  {dataset}/
+    gescf_{dataset}_mask.npy          # Pre-computed change masks
+weights/
+  sam_vit_b_01ec64.pth              # SAM weights (auto-downloaded)
+```
+
+GT depth conversion: `depth_meters = raw_value * 10000 / 100`
 
 ## Quick Start
 
 ```python
-# In img_to_pointcloud.ipynb:
+# img_to_pointcloud.ipynb
 DATASET = "depth4"
-MODEL_TYPE = "depth_pro"
-SCALING_METHOD = "least_squares"
+CAMERA_FOV = 90.0
+GT_TO_CENTIMETERS = 10000.0
+```
+
+```bash
+# Compare depth consistency across models
+python compare_edit_depth/compare_edit_depth.py --model depth_pro --dataset depth4
+
+# Run change detection
+python change_detection_results/test_change_detection.py --dataset depth4
+
+# Benchmark models against GT
+python compare_all_models.py
 ```
 
 ## Requirements
 
-- Python 3.10+
-- PyTorch with CUDA
-- Depth Pro, ZoeDepth (separate venv), or other depth models
-- Open3D, laspy for point cloud I/O
-
-## File Formats
-
-- **RGB**: `HighresScreenshot00000.exr` (UE high-res screenshot)
-- **Depth GT**: `HighresScreenshot00000_SceneDepth.exr` (Z-buffer, use `GT_TO_CENTIMETERS=10000`)
-- **Output**: `.las` point cloud (importable to UE via plugins)
+- Python 3.10+, PyTorch + CUDA
+- `depth_pro`, `segment-anything`, `transformers`
+- `OpenEXR`, `laspy`, `scipy`, `opencv-python`

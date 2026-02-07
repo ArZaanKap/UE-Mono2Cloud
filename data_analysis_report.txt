@@ -1,0 +1,355 @@
+
+================================================================================
+UE DEPTH TO POINT CLOUD - DATA ANALYSIS REPORT
+================================================================================
+
+1. FILE FORMAT ANALYSIS
+-----------------------
+SceneDepth files (HighresScreenshot*_SceneDepth.exr):
+  - Raw values: 0.006 - 0.047 (normalized)
+  - Conversion: depth_cm = raw_value * 10000
+  - Type: Z-buffer (perpendicular distance)
+  - GT_TO_CENTIMETERS = 10000
+
+SceneDepthWorldUnits files (*_SceneDepthWorldUnits.exr):
+  - Raw values: Already in meters
+  - Conversion: depth_cm = raw_value * 100
+  - Type: Euclidean distance (true 3D distance)
+  - GT_TO_CENTIMETERS = 100
+  - WARNING: Avoid for point cloud generation (causes distortion)
+
+Movie Render Queue WorldDepth files:
+  - R channel: Z-buffer depth in centimeters (GT_TO_CENTIMETERS = 1)
+  - G channel: World Y coordinate (not depth)
+  - B channel: World Z/height coordinate (not depth)
+  - Resolution: 1920x1080 (vs 1526x858 for screenshots)
+  - USE R CHANNEL ONLY for depth ground truth
+
+
+2. DATASET COMPARISON
+---------------------
+Dataset          | Resolution | Median Depth | Notes
+-----------------|------------|--------------|---------------------------
+depth4           | 1526x858   | 1.85m        | Room scene with edit.png
+depth5           | 1526x858   | 1.85m        | Same as depth4 (corr=0.999)
+depth_gt_finder  | 1526x858   | 1.20m        | Flat wall calibration
+mrq2             | 1920x1080  | 1.86m        | Movie Render Queue format
+
+
+3. DEPTH MODEL ANALYSIS (Depth Anything V2 Metric Indoor)
+---------------------------------------------------------
+Test Scene: depth4 (room scene)
+  - Model output median: 3.40m
+  - Ground truth median: 1.85m
+  - Scale factor needed: 0.545 (model overestimates by ~2x)
+
+Test Scene: depth_gt_finder (flat wall)
+  - Model output median: 0.86m
+  - Ground truth: 1.20m (constant)
+  - Scale factor needed: 1.40 (model underestimates by ~1.4x)
+
+IMPORTANT: Scale factor varies by scene content!
+
+
+4. SCALING METHOD COMPARISON (depth4 dataset)
+---------------------------------------------
+Method          | Scale  | Shift  | RMSE   | MAE    | RelErr
+----------------|--------|--------|--------|--------|--------
+none            | 1.0    | 0.0    | 1.64m  | 1.52m  | 79.0%
+median          | 0.545  | 0.0    | 0.14m  | 0.09m  | 3.8%
+least_squares   | 0.600  | -0.12  | 0.08m  | 0.06m  | 2.9%
+
+RECOMMENDATION: Use "least_squares" for best accuracy
+
+
+5. CALIBRATION VERIFICATION
+---------------------------
+Flat wall test (depth_gt_finder):
+  - Camera facing flat wall perpendicular
+  - SceneDepth value: 0.012 (constant across all pixels)
+  - Wall distance: 0.012 * 10000 / 100 = 1.20m
+
+VERIFIED: GT_TO_CENTIMETERS = 10000 is CORRECT for SceneDepth files
+
+
+6. KEY FINDINGS
+---------------
+1. SceneDepth uses Z-buffer (perpendicular distance), not Euclidean
+2. WorldUnits uses Euclidean distance (varies at edges due to perspective)
+3. Depth model scale varies by scene - GT alignment is essential
+4. least_squares scaling gives best results for point cloud accuracy
+5. depth4 and depth5 are identical scenes
+
+
+================================================================================
+7. HIGH-RES SCREENSHOT vs MOVIE RENDER QUEUE (MRQ)
+================================================================================
+
+CAPTURE METHOD DIFFERENCES
+--------------------------
+HIGH-RES SCREENSHOT TOOL:
+  - Single frame capture from editor viewport
+  - Quick and easy for testing
+  - Resolution: 1526x858 (in your datasets)
+  - Depth outputs:
+    * SceneDepth: Z-buffer (perpendicular) - USE THIS
+    * SceneDepthWorldUnits: Euclidean - AVOID
+
+MOVIE RENDER QUEUE (MRQ):
+  - Professional rendering pipeline
+  - Higher quality anti-aliasing and sampling
+  - Resolution: 1920x1080 (higher)
+  - Consistent frame-to-frame for sequences
+  - Depth output: WorldDepth (R channel = Z-buffer in cm)
+
+
+MRQ WORLDDEPTH CHANNEL ANALYSIS
+-------------------------------
+The MRQ WorldDepth.exr file encodes multiple values:
+
+  Channel | Content                  | Median Value
+  --------|--------------------------|-------------
+  R       | Z-buffer depth (cm)      | 185.5 cm = 1.86m
+  G       | World Y coordinate       | 222.9 cm
+  B       | World Z (height)         | 70.0 cm
+
+VERIFICATION: MRQ R-channel vs High-Res SceneDepth correlation = 0.9998
+  -> MRQ R-channel IS Z-buffer depth, safe to use as ground truth
+
+
+WHY Z-BUFFER (PERPENDICULAR) DEPTH MATTERS
+------------------------------------------
+Point cloud back-projection formula:
+  X = (pixel_x - cx) * Z / focal_length
+  Y = (pixel_y - cy) * Z / focal_length
+
+The Z in this formula MUST be perpendicular distance (Z-buffer).
+Using Euclidean distance causes barrel distortion where edges bulge outward.
+
+Flat wall test demonstrates this:
+  - SceneDepth (Z-buffer): 1.20m constant across all pixels (correct)
+  - WorldUnits (Euclidean): 1.23m center, 1.96m at edges (incorrect for backprojection)
+
+
+GROUND TRUTH COMPARISON TABLE
+-----------------------------
++---------------------------+-------------+----------+------------------+
+| File Type                 | Depth Type  | GT_TO_CM | Recommendation   |
++---------------------------+-------------+----------+------------------+
+| SceneDepth.exr            | Z-buffer    | 10000    | BEST             |
+| SceneDepthWorldUnits.exr  | Euclidean   | 100      | AVOID            |
+| MRQ WorldDepth.exr (R)    | Z-buffer    | 1        | BEST (if matched)|
++---------------------------+-------------+----------+------------------+
+
+
+RGB INPUT QUALITY FOR DEPTH MODELS
+----------------------------------
++----------------------+------------+----------------------------------+
+| Source               | Resolution | Quality                          |
++----------------------+------------+----------------------------------+
+| MRQ FinalImage.exr   | 1920x1080  | Better AA, HDR, sharper edges    |
+| High-Res Screenshot  | 1526x858   | Good, faster to capture          |
++----------------------+------------+----------------------------------+
+
+Both Depth Anything and Depth Pro resize images internally, so higher
+resolution RGB primarily benefits edge sharpness in the depth output.
+
+
+================================================================================
+8. RECOMMENDED WORKFLOWS
+================================================================================
+
+OPTION A - Simple (Current Setup)
+---------------------------------
+Best for: Quick testing and iteration
+
+  RGB Input:  HighresScreenshot00000.exr (or .png)
+  GT Depth:   HighresScreenshot00000_SceneDepth.exr
+  GT_TO_CM:   10000
+
+  Pros: Files are guaranteed to match (same capture)
+  Cons: Lower resolution
+
+
+OPTION B - Higher Quality MRQ
+-----------------------------
+Best for: Final production renders
+
+  RGB Input:  Seq.FinalImage.0000.exr
+  GT Depth:   Seq.FinalImageMovieRenderQueue_WorldDepth.0000.exr (R channel)
+  GT_TO_CM:   1
+
+  Pros: Higher resolution, better anti-aliasing
+  Cons: Must ensure camera position matches exactly
+
+
+OPTION C - Mixed (Advanced)
+---------------------------
+Best for: Maximum quality with verified GT
+
+  RGB Input:  MRQ FinalImage.exr (for model input)
+  GT Depth:   High-Res SceneDepth.exr (verified Z-buffer)
+
+  Pros: Best of both worlds
+  Cons: Requires matching camera positions exactly between captures
+
+
+CURRENT RECOMMENDATION
+----------------------
+For your depth4 dataset, use OPTION A:
+  - RGB and depth are from same capture (guaranteed alignment)
+  - SceneDepth is verified Z-buffer format
+  - Use SCALING_METHOD = "least_squares" for best accuracy (RMSE = 0.08m)
+
+
+================================================================================
+9. DEPTH MODEL COMPARISON: DEPTH ANYTHING vs DEPTH PRO
+================================================================================
+
+HEAD-TO-HEAD TEST (depth4 dataset, same camera, same GT)
+
+Ground Truth median: 1.85m
+
+RAW OUTPUT (no scaling):
+  Depth Anything Metric: 3.40m median (overestimates by 1.84x)
+  Depth Pro:             2.30m median (overestimates by 1.24x)
+
+FULL METRICS COMPARISON:
++------------------------+----------------+----------+----------+----------+-------+
+| Model                  | Scaling Method | RMSE (m) | MAE (m)  | RelErr % | d1 %  |
++------------------------+----------------+----------+----------+----------+-------+
+| Depth Anything Metric  | none           | 1.6392   | 1.5187   | 79.02    | 0.0   |
+| Depth Anything Metric  | median         | 0.1389   | 0.0865   | 3.84     | 99.8  |
+| Depth Anything Metric  | least_squares  | 0.0844   | 0.0560   | 2.89     | 99.9  |
+| Depth Pro              | none           | 0.5418   | 0.4680   | 22.69    | 56.2  |
+| Depth Pro              | median         | 0.0662   | 0.0504   | 3.18     | 100.0 |
+| Depth Pro              | least_squares  | 0.0550   | 0.0433   | 2.98     | 100.0 |
++------------------------+----------------+----------+----------+----------+-------+
+
+WINNER: Depth Pro (34.8% lower RMSE with least_squares scaling)
+
+SCALE FACTORS NEEDED:
+  Depth Anything: 0.60x scale + (-0.12) shift
+  Depth Pro:      0.77x scale + (+0.08) shift
+
+KEY INSIGHTS:
+1. Depth Pro outputs closer to true scale (less correction needed)
+2. Depth Pro achieves 100% delta1 accuracy (all pixels within 1.25x ratio)
+3. Both models require GT alignment for accurate point clouds
+4. "none" scaling is unusable for either model
+5. least_squares beats median scaling for both models
+
+
+================================================================================
+10. DEPTH MODEL BEHAVIOR NOTES
+================================================================================
+
+Both Depth Anything V2 Metric and Depth Pro are trained on datasets with
+Z-buffer depth (NYU Depth V2, KITTI, Hypersim), so they output Z-buffer
+style depth - matching what we need for point cloud generation.
+
+However, the models do NOT output perfectly calibrated metric depth:
+  - Scale varies by scene type (indoor vs outdoor, room size)
+  - The "Metric" in the name means it attempts real-world scale
+  - Ground truth alignment is still essential for accuracy
+
+Model output characteristics:
+  - Depth Anything Metric: Overestimates indoor depth by ~1.8x
+  - Depth Pro: Overestimates indoor depth by ~1.2x (better)
+  - Both models: Edges and fine details may have artifacts
+  - Resolution: Models resize internally (typically to 518x518 or similar)
+
+
+================================================================================
+11. FINAL RECOMMENDATIONS
+================================================================================
+
+FOR BEST POINT CLOUD ACCURACY:
+  Model:          Depth Pro
+  Scaling:        least_squares
+  Expected RMSE:  ~0.055m (5.5cm)
+  Expected d1:    100%
+
+ALTERNATIVE (if Depth Pro unavailable):
+  Model:          Depth Anything V2 Metric Indoor
+  Scaling:        least_squares
+  Expected RMSE:  ~0.084m (8.4cm)
+  Expected d1:    99.9%
+
+CONFIGURATION IN NOTEBOOK:
+  MODEL_TYPE = "depth_pro"
+  SCALING_METHOD = "least_squares"
+  GT_TO_CENTIMETERS = 10000  (for SceneDepth files)
+
+
+================================================================================
+12. METRICS EXPLAINED
+================================================================================
+
+RMSE (Root Mean Square Error) - MOST IMPORTANT
+  Formula: sqrt(mean((pred - gt)²))
+  Meaning: Average error in meters, penalizes large errors
+  Use: Directly tells you how far off 3D points will be
+  Your result: 0.055m = 5.5cm average geometric error
+
+MAE (Mean Absolute Error)
+  Formula: mean(|pred - gt|)
+  Meaning: Average absolute error, robust to outliers
+  Use: If MAE << RMSE, you have outliers; if similar, errors are consistent
+  Your result: 0.043m (close to RMSE = consistent errors)
+
+RelErr (Relative Error)
+  Formula: mean(|pred - gt| / gt) × 100%
+  Meaning: Percentage error relative to true depth
+  Use: Scale-invariant, good for comparing across different scenes
+  Your result: 3.0%
+
+Delta1 (δ < 1.25) - INDUSTRY STANDARD ACCURACY
+  Formula: % of pixels where max(pred/gt, gt/pred) < 1.25
+  Meaning: What % of pixels are within 25% of correct depth
+  Use: Standard benchmark metric in depth estimation papers
+  Your result: 100% (all pixels within tolerance)
+
+Scale Factor
+  Meaning: How much model over/underestimates depth
+  Scale < 1 = overestimates (predicts too far)
+  Scale > 1 = underestimates (predicts too close)
+
+METRIC IMPORTANCE RANKING (for Point Cloud Accuracy):
+  1. RMSE      - Direct geometric error in meters
+  2. Delta1    - Industry standard, % of good pixels
+  3. RelErr    - Scale-invariant comparison
+  4. MAE       - Robust average error
+  5. Scale     - Diagnostic (corrected by alignment)
+
+
+================================================================================
+13. FINAL COMPARISON TABLE
+================================================================================
+
++----------------------+----------------+--------+--------+--------+--------+-------+
+| Model                | Scaling        | RMSE   | MAE    | RelErr | Delta1 | Scale |
++----------------------+----------------+--------+--------+--------+--------+-------+
+| Depth Anything       | none           | 1.64m  | 1.52m  | 79.0%  | 0.0%   | 1.00  |
+| Depth Anything       | median         | 0.14m  | 0.09m  | 3.8%   | 99.8%  | 0.55  |
+| Depth Anything       | least_squares  | 0.08m  | 0.06m  | 2.9%   | 99.9%  | 0.60  |
+| Depth Pro            | none           | 0.54m  | 0.47m  | 22.8%  | 54.2%  | 1.00  |
+| Depth Pro            | median         | 0.07m  | 0.05m  | 3.2%   | 100%   | 0.80  |
+| Depth Pro (BEST)     | least_squares  | 0.055m | 0.043m | 3.0%   | 100%   | 0.77  |
++----------------------+----------------+--------+--------+--------+--------+-------+
+
+WINNER: Depth Pro + least_squares
+  - 35% lower RMSE than Depth Anything
+  - 100% Delta1 accuracy (all pixels within 25% of GT)
+  - Closer to true scale (0.77x vs 0.55x correction needed)
+
+PRACTICAL MEANING OF 5.5cm RMSE:
+  - Wall positions: ±5cm accuracy (barely noticeable)
+  - Furniture edges: slightly fuzzy
+  - Overall room shape: accurate
+  - Suitable for visualization; may need refinement for precise measurements
+
+
+================================================================================
+END OF REPORT
+================================================================================

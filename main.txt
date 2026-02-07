@@ -1,0 +1,88 @@
+PIPELINE: Image Edit -> Depth-Aware Point Cloud
+================================================
+
+INPUT
+  - Original UE render (.exr RGB + SceneDepth)
+  - Edited image (.png) with modifications (e.g. added ladder, furniture)
+  - GT_TO_CENTIMETERS = 10000.0 (UE scene depth units -> cm, then /100 -> metres)
+  - CAMERA_FOV = 90 degrees
+
+PIPELINE STEPS
+  1. Load data
+  2. Sky detection (GT depth)
+  3. Change detection (SAM + GeSCF)
+  4. Monocular depth prediction (DepthPro on edited image)
+  5. Least-squares scaling (align prediction to GT on unchanged regions)
+  6. Point cloud generation + sky filtering
+  7. Export as .las
+
+------------------------------------------------------------------------
+
+SKY DETECTION — Density Knee Method
+  Problem:  UE sky dome renders at varying depths (not a single far-clip
+            sentinel), producing a flat sparse tail in the depth histogram.
+            A gap-based heuristic fails because there are no large gaps in
+            a uniform distribution.
+  Solution: Histogram GT depth (0.25m bins), smooth, find the peak of the
+            dense scene cluster, then walk right until bin count drops
+            below 5% of peak. That "knee" is the sky threshold.
+  Example:  test2 — peak at 1.4m, knee at 4.88m, scene=97.3%, tail=2.7%.
+
+------------------------------------------------------------------------
+
+CHANGE DETECTION — GeSCF (SAM attention features)
+  - Hook SAM ViT-B block 8 Q/K/V features for original and edited images
+  - Cosine distance -> distance map -> Gaussian smooth -> normalise
+  - Adaptive threshold: mean + k*std, where k = clip(skewness, 1, 3)
+  - SAM segment refinement: include any segment with >30% overlap with
+    the initial change mask
+
+------------------------------------------------------------------------
+
+DEPTH PREDICTION + SCALING
+  - DepthPro infers metric depth on the edited image (full resolution)
+  - Least-squares fit (scale, shift) on unchanged non-sky pixels where
+    GT is reliable: depth_scaled = pred * scale + shift
+  - p98 cap on predictions excludes DepthPro sky overestimates from fit
+
+------------------------------------------------------------------------
+
+SKY FILTERING IN POINT CLOUD — Changed vs Unchanged Strategy
+  Critical: The GT-based sky mask reflects the ORIGINAL scene.
+  Edited content (e.g. ladder placed over a wall into sky) would be
+  wrongly removed if we blindly apply the GT mask everywhere.
+
+  Rule:
+    UNCHANGED pixels -> trust GT sky_mask (scene is the same)
+    CHANGED pixels   -> ignore GT sky_mask, use predicted depth instead:
+                        if depth_scaled > depth_cap_scaled -> sky (remove)
+                        else -> real object (keep)
+
+  depth_cap        = max GT depth in non-sky region (~4.87m for test2)
+  depth_cap_scaled = depth_cap * scale + shift (~7.39m for test2)
+
+  This keeps the ladder (DepthPro predicts ~2-4m, below cap) while still
+  removing any remaining sky in the changed region (predicted >> cap).
+
+  Code:
+    sky_unchanged = sky_full & ~changed_full
+    sky_changed   = changed_full & (depth_full > depth_cap_scaled)
+    sky_combined  = sky_unchanged | sky_changed
+    mask = (z >= MIN_DEPTH) & (z <= MAX_DEPTH) & ~sky_combined
+
+------------------------------------------------------------------------
+
+POINT CLOUD PROJECTION
+  - Pinhole model: focal = width / (2 * tan(FOV/2))
+  - x = (px_x - cx) * z / focal
+  - y = (px_y - cy) * z / focal
+  - LAS axes: X=depth(forward), Y=-x(right), Z=-y(up)
+
+------------------------------------------------------------------------
+
+KEY PARAMETERS
+  MIN_DEPTH       0.001m    minimum valid depth
+  MAX_DEPTH       50.0m     hard upper bound (safety net)
+  KNEE_FRAC       0.05      5% of peak — knee detection sensitivity
+  bin_width       0.25m     histogram resolution for knee detection
+  smooth_size     5         uniform filter width for histogram smoothing
