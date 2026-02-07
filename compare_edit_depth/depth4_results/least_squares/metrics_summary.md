@@ -20,15 +20,16 @@ predictions** regardless of edits elsewhere in the image. Lower values = better 
 
 | Metric | depth_anything | depth_pro | metric3d |
 |--------|--------|--------|--------|
-| Scale factor | 0.0152 | 0.7748 | 0.3509 |
-| Orig vs GT (m) | 0.0555 | 0.0432 | 0.0711 |
-| Edit vs GT (m) | 0.0705 | 0.0879 | 0.2155 |
-| MAE (m) | 0.0547 | 0.0819 | 0.2157 |
-| RMSE (m) | 0.0887 | 0.1100 | 0.2481 |
-| Max diff (m) | 1.7065 | 1.9891 | 2.0277 |
-| Std dev (m) | 0.0708 | 0.0744 | 0.1235 |
-| % diff > 0.1m | 16.84 | 30.91 | 85.30 |
-| % diff > 0.5m | 0.22 | 0.26 | 0.27 |
+| Scale factor | 0.6001 | 0.7747 | 0.3509 |
+| Orig vs GT (m) | 0.0552 | 0.0434 | 0.0711 |
+| Edit vs GT (m) | 0.0567 | 0.0866 | 0.2155 |
+| Edit vs GT RMSE (m) | 0.0940 | 0.1069 | - |
+| MAE (m) | 0.0207 | 0.0801 | 0.2157 |
+| RMSE (m) | 0.0392 | 0.0938 | 0.2481 |
+| Max diff (m) | 1.7433 | 2.2994 | 2.0277 |
+| Std dev (m) | 0.0363 | 0.0502 | 0.1235 |
+| % diff > 0.1m | 1.16 | 30.74 | 85.30 |
+| % diff > 0.5m | 0.07 | 0.13 | 0.27 |
 
 ## Interpretation
 
@@ -42,4 +43,4 @@ predictions** regardless of edits elsewhere in the image. Lower values = better 
 - **% diff > 0.1m / 0.5m**: Percentage of unchanged pixels with depth differences exceeding threshold.
 
 ---
-*Last updated: metric3d*
+*Last updated: depth_pro*

@@ -22,7 +22,6 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import OpenEXR
 import Imath
-import torch
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -162,7 +161,7 @@ from transformers import pipeline
 pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf", device=0)
 img = load_image("{rgb_path_safe}")
 result = pipe(img)
-depth = np.array(result["depth"])
+depth = result["predicted_depth"].numpy()
 np.save("{output_path_safe}", depth)
 print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
 '''
@@ -233,77 +232,19 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
     return result.stdout.strip()
 
 
-def refine_mask(mask, min_area=500, dilate_iter=2):
-    """
-    Refine binary mask by removing small regions and smoothing.
-    """
-    from scipy import ndimage
-    mask = mask.copy()
-    # Remove small connected components
-    labeled, num_features = ndimage.label(mask)
-    for i in range(1, num_features + 1):
-        if np.sum(labeled == i) < min_area:
-            mask[labeled == i] = False
-
-    # Dilate to fill gaps
-    mask = ndimage.binary_dilation(mask, iterations=dilate_iter)
-
-    # Fill holes
-    mask = ndimage.binary_fill_holes(mask)
-
-    return mask
-
-
-def dinov2_feature_mask(img1, img2, threshold=0.35, model_name="facebook/dinov2-base"):
-    """
-    DINOv2 feature-based change detection.
-    Extracts patch features and computes cosine distance.
-    Returns mask where True = changed region.
-    """
-    from transformers import AutoImageProcessor, AutoModel
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Loading DINOv2 for semantic change detection...")
-
-    processor = AutoImageProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
-    model.eval()
-
-    # Process images
-    with torch.no_grad():
-        inputs1 = processor(images=img1, return_tensors="pt").to(device)
-        inputs2 = processor(images=img2, return_tensors="pt").to(device)
-
-        # Get patch features (excluding CLS token)
-        outputs1 = model(**inputs1)
-        outputs2 = model(**inputs2)
-
-        # last_hidden_state shape: [batch, num_patches+1, hidden_dim]
-        features1 = outputs1.last_hidden_state[:, 1:, :]
-        features2 = outputs2.last_hidden_state[:, 1:, :]
-
-        # Compute cosine similarity per patch
-        features1_norm = features1 / features1.norm(dim=-1, keepdim=True)
-        features2_norm = features2 / features2.norm(dim=-1, keepdim=True)
-        similarity = (features1_norm * features2_norm).sum(dim=-1)
-
-        # Convert to distance (1 - similarity)
-        distance = 1 - similarity.squeeze().cpu().numpy()
-
-    # Reshape to 2D patch grid
-    num_patches = distance.shape[0]
-    grid_size = int(np.sqrt(num_patches))
-    distance_map = distance.reshape(grid_size, grid_size)
-
-    # Upsample to original image size
-    h, w = np.array(img1).shape[:2]
-    distance_map_full = np.array(Image.fromarray(distance_map.astype(np.float32)).resize(
-        (w, h), Image.BILINEAR))
-
-    # Threshold to get binary mask
-    changed_mask = distance_map_full > threshold
-
-    return changed_mask
+def load_change_mask(mask_model, dataset):
+    """Load a pre-computed change mask from change_detection_results/."""
+    mask_dir = os.path.join(PROJECT_ROOT, "change_detection_results", dataset)
+    mask_path = os.path.join(mask_dir, f"{mask_model}_{dataset}_mask.npy")
+    if not os.path.exists(mask_path):
+        raise FileNotFoundError(
+            f"Mask not found: {mask_path}\n"
+            f"Run test_change_detection.py --dataset {dataset} first."
+        )
+    mask = np.load(mask_path)
+    print(f"  Loaded mask: {mask_path}")
+    print(f"  Changed pixels: {mask.sum():,} ({mask.mean()*100:.1f}%)")
+    return mask.astype(bool)
 
 
 def main():
@@ -319,8 +260,9 @@ def main():
                         help=f'Dataset to use: {AVAILABLE_DATASETS}')
     parser.add_argument('--no-show', action='store_true',
                         help='Do not display the figure (useful for headless)')
-    parser.add_argument('--rgb-only', action='store_true',
-                        help='Use RGB threshold only (skip DINOv2 for faster processing)')
+    parser.add_argument('--mask-model', type=str, default='gescf',
+                        choices=['dinov2', 'gescf'],
+                        help='Change detection mask to use (from test_change_detection.py output)')
     args = parser.parse_args()
 
     model_key = args.model
@@ -345,6 +287,7 @@ def main():
     print(f"Model: {model_name}")
     print(f"Scaling: {scaling_folder}")
     print(f"Dataset: {dataset}")
+    print(f"Mask model: {args.mask_model}")
     print(f"Output: {dataset}_results/{scaling_folder}/{output_filename}")
 
     # Find files
@@ -442,33 +385,15 @@ def main():
     # Compute difference on scaled predictions
     depth_diff = depth_edited_scaled - depth_original_scaled
 
-    # Compute unchanged region mask using intersection of RGB and DINOv2
-    # This provides high-confidence change detection where both methods agree
-    orig_arr = np.array(original_img).astype(float)
-    edit_arr = np.array(edited_img).astype(float)
-    img_diff = np.abs(orig_arr - edit_arr).mean(axis=2)
+    # Load pre-computed change mask from change_detection_results/
+    mask_model = args.mask_model
+    print(f"\nLoading change mask (model: {mask_model})...")
+    changed_mask = load_change_mask(mask_model, dataset)
 
-    # Method 1: RGB threshold
-    rgb_threshold = 25  # pixel difference threshold (25 filters compression artifacts)
-    rgb_changed_mask = img_diff > rgb_threshold
-    rgb_changed_mask = refine_mask(rgb_changed_mask.copy(), min_area=500, dilate_iter=2)
-
-    if args.rgb_only:
-        # RGB-only mode (faster)
-        changed_mask = rgb_changed_mask
-        print(f"\nUsing RGB-only mask: {changed_mask.mean()*100:.1f}% changed")
-    else:
-        # Method 2: DINOv2 semantic features
-        print("\nComputing semantic change mask...")
-        dino_changed_mask = dinov2_feature_mask(original_img, edited_img, threshold=0.35)
-        dino_changed_mask = refine_mask(dino_changed_mask.copy(), min_area=500, dilate_iter=2)
-
-        # Intersection: high-confidence changes (both methods agree)
-        changed_mask = rgb_changed_mask & dino_changed_mask
-
-        print(f"  RGB changed: {rgb_changed_mask.mean()*100:.1f}%")
-        print(f"  DINOv2 changed: {dino_changed_mask.mean()*100:.1f}%")
-        print(f"  Intersection: {changed_mask.mean()*100:.1f}% (high-confidence)")
+    # Resize mask to match GT if needed
+    if changed_mask.shape != gt_depth.shape:
+        changed_mask = np.array(Image.fromarray(changed_mask.astype(np.uint8) * 255).resize(
+            (gt_depth.shape[1], gt_depth.shape[0]), Image.NEAREST)) > 127
 
     unchanged_mask = ~changed_mask
 
@@ -490,6 +415,7 @@ def main():
 
     mae_orig_vs_gt = np.mean(np.abs(orig_unchanged - gt_unchanged))
     mae_edit_vs_gt = np.mean(np.abs(edit_unchanged - gt_unchanged))
+    rmse_edit_vs_gt = np.sqrt(np.mean((edit_unchanged - gt_unchanged) ** 2))
 
     # Statistics
     print("\n" + "=" * 70)
@@ -508,9 +434,10 @@ def main():
     print(f"  % diff > 0.5m:    {pct_above_05m:.2f}%")
 
     print(f"\nAlignment to GT (unchanged regions):")
-    print(f"  Original vs GT MAE: {mae_orig_vs_gt:.4f}m")
-    print(f"  Edited vs GT MAE:   {mae_edit_vs_gt:.4f}m")
-    print(f"  Drift from GT:      {mae_edit_vs_gt - mae_orig_vs_gt:+.4f}m")
+    print(f"  Original vs GT MAE:  {mae_orig_vs_gt:.4f}m")
+    print(f"  Edited vs GT MAE:    {mae_edit_vs_gt:.4f}m")
+    print(f"  Edited vs GT RMSE:   {rmse_edit_vs_gt:.4f}m")
+    print(f"  Drift from GT:       {mae_edit_vs_gt - mae_orig_vs_gt:+.4f}m")
 
     print(f"\nOverall Difference (Edited - Original):")
     print(f"  Min:    {depth_diff.min():.4f}m")
@@ -527,6 +454,7 @@ def main():
         'Scale factor': float(scale),
         'Orig vs GT (m)': float(mae_orig_vs_gt),
         'Edit vs GT (m)': float(mae_edit_vs_gt),
+        'Edit vs GT RMSE (m)': float(rmse_edit_vs_gt),
         'MAE (m)': float(mae_unchanged),
         'RMSE (m)': float(rmse_unchanged),
         'Max diff (m)': float(max_diff_unchanged),
@@ -594,7 +522,10 @@ predictions** regardless of edits elsewhere in the image. Lower values = better 
     for metric in metric_names:
         row = f"| {metric} |"
         for model in models_order:
-            value = all_metrics[model][metric]
+            value = all_metrics[model].get(metric, None)
+            if value is None:
+                row += " - |"
+                continue
             if '%' in metric:
                 row += f" {value:.2f} |"
             elif 'Scale' in metric:
@@ -638,7 +569,7 @@ predictions** regardless of edits elsewhere in the image. Lower values = better 
     axes[0, 1].axis('off')
 
     axes[0, 2].imshow(changed_mask, cmap='gray')
-    axes[0, 2].set_title(f'Changed Regions (threshold={rgb_threshold})', fontsize=12)
+    axes[0, 2].set_title(f'Changed Regions ({mask_model})', fontsize=12)
     axes[0, 2].axis('off')
 
     # Row 2: Depth maps
@@ -690,7 +621,7 @@ predictions** regardless of edits elsewhere in the image. Lower values = better 
     axes[2, 2].axis('off')
     plt.colorbar(im5, ax=axes[2, 2], fraction=0.046, pad=0.04, label='meters')
 
-    plt.suptitle(f'Depth Comparison: Original vs Edited ({model_name})', fontsize=14, fontweight='bold')
+    plt.suptitle(f'Depth Comparison: Original vs Edited ({model_name}, mask: {mask_model})', fontsize=14, fontweight='bold')
     plt.tight_layout()
 
     # Always save to output folder

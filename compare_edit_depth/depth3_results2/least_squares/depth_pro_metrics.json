@@ -1,14 +1,9 @@
 {
-  "model": "depth_pro",
-  "scaling_method": "ls",
-  "scale": 0.8865849375724792,
-  "shift": 0.02677105739712715,
-  "n_unchanged": 1337130,
-  "n_changed": 27114,
-  "pct_unchanged": 98.01252561858436,
-  "pct_changed": 1.9874743814156413,
-  "depth_min": 0.7833594679832458,
-  "depth_max": 4.297985553741455,
-  "unchanged_match_gt": true,
-  "changed_match_pred": true
+  "Scale factor": 0.8832759261131287,
+  "Edit vs GT (m)": 0.045079704374074936,
+  "RMSE (m)": 0.07607809454202652,
+  "Max diff (m)": 2.116408348083496,
+  "Std dev (m)": 0.07607809454202652,
+  "% diff > 0.1m": 7.42346362089987,
+  "% diff > 0.5m": 0.19292985817468936
 }

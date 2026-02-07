@@ -2,12 +2,20 @@
 *.pt
 *.pth
 checkpoints/
+weights/
 
 # Data and Results
 *.exr
 *.npy
 data/
 output/
+
+# Third-party repos
+Robust-Scene-Change-Detection/
+
+# Junk files
+nul
+_ul
 
 # Local Settings
 .claude/

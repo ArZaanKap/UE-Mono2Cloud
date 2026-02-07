@@ -1,12 +1,14 @@
 """
-Composite Depth Map Generator
-=============================
-Creates a composite depth map where:
-- Unchanged regions: Use GT depth directly
-- Changed regions: Use scaled model prediction (scale computed from unchanged regions)
+Scaled Depth Map: Calibrate on Edited Image (Unchanged Regions)
+================================================================
+Runs a depth model on the edited image only, then calibrates by fitting
+the prediction (unchanged regions) to GT depth.
 
-This differs from compare_edit_depth.py which measures model consistency.
-This script generates an aligned depth output suitable for downstream tasks.
+Key difference from v1 (compare_edit_depth.py):
+  v1: scale factor from original prediction vs GT (all pixels)
+  v2: scale factor from edited prediction vs GT (unchanged pixels only)
+
+The comparable metric is "Edit vs GT MAE" — same measurement, different scaling.
 """
 
 import os
@@ -20,7 +22,6 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import OpenEXR
 import Imath
-import torch
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -160,7 +161,7 @@ from transformers import pipeline
 pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf", device=0)
 img = load_image("{rgb_path_safe}")
 result = pipe(img)
-depth = np.array(result["depth"])
+depth = result["predicted_depth"].numpy()
 np.save("{output_path_safe}", depth)
 print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
 '''
@@ -231,99 +232,23 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
     return result.stdout.strip()
 
 
-def refine_mask(mask, min_area=500, dilate_iter=2):
-    """
-    Refine binary mask by removing small regions and smoothing.
-    """
-    from scipy import ndimage
-    mask = mask.copy()
-    # Remove small connected components
-    labeled, num_features = ndimage.label(mask)
-    for i in range(1, num_features + 1):
-        if np.sum(labeled == i) < min_area:
-            mask[labeled == i] = False
-
-    # Dilate to fill gaps
-    mask = ndimage.binary_dilation(mask, iterations=dilate_iter)
-
-    # Fill holes
-    mask = ndimage.binary_fill_holes(mask)
-
-    return mask
-
-
-def dinov2_feature_mask(img1, img2, threshold=0.35, model_name="facebook/dinov2-base"):
-    """
-    DINOv2 feature-based change detection.
-    Extracts patch features and computes cosine distance.
-    Returns mask where True = changed region.
-    """
-    from transformers import AutoImageProcessor, AutoModel
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Loading DINOv2 for semantic change detection...")
-
-    processor = AutoImageProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
-    model.eval()
-
-    # Process images
-    with torch.no_grad():
-        inputs1 = processor(images=img1, return_tensors="pt").to(device)
-        inputs2 = processor(images=img2, return_tensors="pt").to(device)
-
-        # Get patch features (excluding CLS token)
-        outputs1 = model(**inputs1)
-        outputs2 = model(**inputs2)
-
-        # last_hidden_state shape: [batch, num_patches+1, hidden_dim]
-        features1 = outputs1.last_hidden_state[:, 1:, :]
-        features2 = outputs2.last_hidden_state[:, 1:, :]
-
-        # Compute cosine similarity per patch
-        features1_norm = features1 / features1.norm(dim=-1, keepdim=True)
-        features2_norm = features2 / features2.norm(dim=-1, keepdim=True)
-        similarity = (features1_norm * features2_norm).sum(dim=-1)
-
-        # Convert to distance (1 - similarity)
-        distance = 1 - similarity.squeeze().cpu().numpy()
-
-    # Reshape to 2D patch grid
-    num_patches = distance.shape[0]
-    grid_size = int(np.sqrt(num_patches))
-    distance_map = distance.reshape(grid_size, grid_size)
-
-    # Upsample to original image size
-    h, w = np.array(img1).shape[:2]
-    distance_map_full = np.array(Image.fromarray(distance_map.astype(np.float32)).resize(
-        (w, h), Image.BILINEAR))
-
-    # Threshold to get binary mask
-    changed_mask = distance_map_full > threshold
-
-    return changed_mask
-
-
-def create_composite_depth(gt_depth, pred_scaled, unchanged_mask):
-    """
-    Create composite depth map:
-    - Unchanged regions: Use GT depth directly
-    - Changed regions: Use scaled prediction
-
-    Args:
-        gt_depth: Ground truth depth (H, W)
-        pred_scaled: Scaled model prediction (H, W)
-        unchanged_mask: Boolean mask where True = unchanged (H, W)
-
-    Returns:
-        composite_depth: Blended depth map (H, W)
-    """
-    composite_depth = np.where(unchanged_mask, gt_depth, pred_scaled)
-    return composite_depth
+def load_change_mask(mask_model, dataset):
+    """Load a pre-computed change mask from change_detection_results/."""
+    mask_dir = os.path.join(PROJECT_ROOT, "change_detection_results", dataset)
+    mask_path = os.path.join(mask_dir, f"{mask_model}_{dataset}_mask.npy")
+    if not os.path.exists(mask_path):
+        raise FileNotFoundError(
+            f"Mask not found: {mask_path}\n"
+            f"Run test_change_detection.py --dataset {dataset} first."
+        )
+    mask = np.load(mask_path)
+    print(f"  Loaded mask: {mask_path}")
+    print(f"  Changed pixels: {mask.sum():,} ({mask.mean()*100:.1f}%)")
+    return mask.astype(bool)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Generate composite depth map from GT and model prediction')
+    parser = argparse.ArgumentParser(description='Generate scaled depth map for edited image using GT-calibrated scale factor')
     parser.add_argument('--model', type=str, default='depth_pro',
                         choices=list(AVAILABLE_MODELS.keys()),
                         help=f'Model to use: {list(AVAILABLE_MODELS.keys())}')
@@ -335,14 +260,16 @@ def main():
                         help=f'Dataset to use: {AVAILABLE_DATASETS}')
     parser.add_argument('--no-show', action='store_true',
                         help='Do not display the figure (useful for headless)')
-    parser.add_argument('--rgb-only', action='store_true',
-                        help='Use RGB threshold only (skip DINOv2 for faster processing)')
+    parser.add_argument('--mask-model', type=str, default='gescf',
+                        choices=['dinov2', 'gescf'],
+                        help='Change detection mask to use (from test_change_detection.py output)')
     args = parser.parse_args()
 
     model_key = args.model
     model_name = AVAILABLE_MODELS[model_key]
     scaling_method = args.scaling
     scaling_folder = 'median' if scaling_method == 'median' else 'least_squares'
+    mask_model = args.mask_model
     dataset = args.dataset
     input_folder = os.path.join(PROJECT_ROOT, "data", dataset)
 
@@ -350,13 +277,18 @@ def main():
     output_subfolder = os.path.join(OUTPUT_FOLDER, f"{dataset}_results2", scaling_folder)
     os.makedirs(output_subfolder, exist_ok=True)
 
+    # Auto-generate output filename
+    output_filename = f"{model_key}_visualization.png"
+    output_path = os.path.join(output_subfolder, output_filename)
+
     print("=" * 70)
-    print("COMPOSITE DEPTH MAP GENERATOR")
+    print("SCALED DEPTH MAP GENERATOR")
     print("=" * 70)
     print(f"Model: {model_name}")
     print(f"Scaling: {scaling_folder}")
+    print(f"Mask model: {mask_model}")
     print(f"Dataset: {dataset}")
-    print(f"Output folder: {dataset}_results2/{scaling_folder}/")
+    print(f"Output: {dataset}_results2/{scaling_folder}/{output_filename}")
 
     # Find files
     original_path, edited_path, gt_depth_path = find_files(input_folder)
@@ -386,7 +318,7 @@ def main():
     print(f"GT depth shape: {gt_depth.shape}")
     print(f"GT depth range: {gt_depth.min():.2f}m - {gt_depth.max():.2f}m")
 
-    # Run model on edited image ONLY
+    # Run model on EDITED image only
     print("\n" + "-" * 50)
     print(f"Running {model_name} on EDITED image...")
 
@@ -396,185 +328,145 @@ def main():
     try:
         output = run_model_subprocess(model_key, edited_path, output_edited)
         print(f"  {output}")
-        depth_pred = np.load(output_edited)
+        depth_edited = np.load(output_edited)
     finally:
         if os.path.exists(output_edited):
             os.remove(output_edited)
 
     # Resize prediction to match GT if needed
     target_shape = gt_depth.shape
-    if depth_pred.shape != target_shape:
-        depth_pred = np.array(Image.fromarray(depth_pred.astype(np.float32)).resize(
+    if depth_edited.shape != target_shape:
+        depth_edited = np.array(Image.fromarray(depth_edited.astype(np.float32)).resize(
             (target_shape[1], target_shape[0]), Image.BILINEAR))
 
     # Resize edited image for display if needed
     if edited_img.size != original_img.size:
         edited_img = edited_img.resize(original_img.size, Image.BILINEAR)
 
-    # Compute change mask using intersection of RGB and DINOv2
-    orig_arr = np.array(original_img).astype(float)
-    edit_arr = np.array(edited_img).astype(float)
-    img_diff = np.abs(orig_arr - edit_arr).mean(axis=2)
+    # Load pre-computed change mask from change_detection_results/
+    print(f"\nLoading change mask (model: {mask_model})...")
+    changed_mask = load_change_mask(mask_model, dataset)
 
-    # Method 1: RGB threshold
-    rgb_threshold = 25  # pixel difference threshold
-    rgb_changed_mask = img_diff > rgb_threshold
-    rgb_changed_mask = refine_mask(rgb_changed_mask.copy(), min_area=500, dilate_iter=2)
-
-    if args.rgb_only:
-        # RGB-only mode (faster)
-        changed_mask = rgb_changed_mask
-        print(f"\nUsing RGB-only mask: {changed_mask.mean()*100:.1f}% changed")
-    else:
-        # Method 2: DINOv2 semantic features
-        print("\nComputing semantic change mask...")
-        dino_changed_mask = dinov2_feature_mask(original_img, edited_img, threshold=0.35)
-        dino_changed_mask = refine_mask(dino_changed_mask.copy(), min_area=500, dilate_iter=2)
-
-        # Intersection: high-confidence changes (both methods agree)
-        changed_mask = rgb_changed_mask & dino_changed_mask
-
-        print(f"  RGB changed: {rgb_changed_mask.mean()*100:.1f}%")
-        print(f"  DINOv2 changed: {dino_changed_mask.mean()*100:.1f}%")
-        print(f"  Intersection: {changed_mask.mean()*100:.1f}% (high-confidence)")
+    # Resize mask to match GT if needed
+    if changed_mask.shape != target_shape:
+        changed_mask = np.array(Image.fromarray(changed_mask.astype(np.uint8) * 255).resize(
+            (target_shape[1], target_shape[0]), Image.NEAREST)) > 127
 
     unchanged_mask = ~changed_mask
 
-    # Compute scale factor from unchanged regions
+    # Scale edited prediction using UNCHANGED REGIONS vs GT
+    # (This is the key difference from v1, which scales using the original prediction)
     print("\n" + "-" * 50)
-    print("Computing scale factor from unchanged regions...")
+    print("Computing scale factor from EDITED prediction (unchanged regions)...")
 
-    # Valid mask: unchanged regions with valid depth values
-    valid_mask = unchanged_mask & (gt_depth > 0.1) & (gt_depth < 100) & np.isfinite(depth_pred) & np.isfinite(gt_depth)
-    pred_valid = depth_pred[valid_mask].flatten()
+    valid_mask = unchanged_mask & (gt_depth > 0.1) & (gt_depth < 100) & np.isfinite(depth_edited) & np.isfinite(gt_depth)
+    pred_valid = depth_edited[valid_mask].flatten()
     gt_valid = gt_depth[valid_mask].flatten()
 
     if scaling_method == 'median':
-        # Median scaling: scale only, no shift
         scale = np.median(gt_valid) / np.median(pred_valid)
         shift = 0.0
-        pred_scaled = depth_pred * scale
-        print(f"Scaling (median): scale={scale:.4f}")
+        depth_edited_scaled = depth_edited * scale
+        print(f"Scaling (median from edited unchanged): scale={scale:.4f}")
     else:
-        # Least squares scaling: scale + shift
         A = np.vstack([pred_valid, np.ones_like(pred_valid)]).T
         result = np.linalg.lstsq(A, gt_valid, rcond=None)
         scale, shift = result[0]
-        pred_scaled = depth_pred * scale + shift
-        print(f"Scaling (least_squares): scale={scale:.4f}, shift={shift:.4f}")
+        depth_edited_scaled = depth_edited * scale + shift
+        print(f"Scaling (least_squares from edited unchanged): scale={scale:.4f}, shift={shift:.4f}")
 
-    # Create composite depth map
-    print("\nCreating composite depth map...")
-    composite_depth = create_composite_depth(gt_depth, pred_scaled, unchanged_mask)
+    # Metrics: how well does scaled edited prediction match GT in unchanged regions?
+    edit_unchanged = depth_edited_scaled[unchanged_mask]
+    gt_unchanged = gt_depth[unchanged_mask]
+    mae_edit_vs_gt = np.mean(np.abs(edit_unchanged - gt_unchanged))
+    rmse_edit_vs_gt = np.sqrt(np.mean((edit_unchanged - gt_unchanged) ** 2))
+    max_diff = np.max(np.abs(edit_unchanged - gt_unchanged))
+    std_diff = np.std(edit_unchanged - gt_unchanged)
+    pct_above_01m = np.mean(np.abs(edit_unchanged - gt_unchanged) > 0.1) * 100
+    pct_above_05m = np.mean(np.abs(edit_unchanged - gt_unchanged) > 0.5) * 100
 
-    # Compute statistics
-    n_unchanged = unchanged_mask.sum()
-    n_changed = changed_mask.sum()
-    n_total = unchanged_mask.size
-    pct_unchanged = n_unchanged / n_total * 100
-    pct_changed = n_changed / n_total * 100
+    # Statistics
+    print("\n" + "=" * 70)
+    print(f"DEPTH STATISTICS (after {scaling_folder} scaling)")
+    print("=" * 70)
+    print(f"\nGT Depth:       min={gt_depth.min():.2f}m, max={gt_depth.max():.2f}m, median={np.median(gt_depth):.2f}m")
+    print(f"Pred Edited:    min={depth_edited_scaled.min():.2f}m, max={depth_edited_scaled.max():.2f}m, median={np.median(depth_edited_scaled):.2f}m")
 
-    # Verify composite construction
-    gt_in_unchanged = composite_depth[unchanged_mask]
-    gt_ref_unchanged = gt_depth[unchanged_mask]
-    unchanged_match = np.allclose(gt_in_unchanged, gt_ref_unchanged)
-
-    pred_in_changed = composite_depth[changed_mask]
-    pred_ref_changed = pred_scaled[changed_mask]
-    changed_match = np.allclose(pred_in_changed, pred_ref_changed)
-
-    print(f"\nComposite depth statistics:")
-    print(f"  Shape: {composite_depth.shape}")
-    print(f"  Range: {composite_depth.min():.2f}m - {composite_depth.max():.2f}m")
-    print(f"  Unchanged pixels: {n_unchanged} ({pct_unchanged:.1f}%)")
-    print(f"  Changed pixels: {n_changed} ({pct_changed:.1f}%)")
-    print(f"  Unchanged == GT: {unchanged_match}")
-    print(f"  Changed == Scaled Pred: {changed_match}")
-
-    # Save outputs
-    print("\n" + "-" * 50)
-    print("Saving outputs...")
-
-    # Save composite depth as .npy
-    depth_output_path = os.path.join(output_subfolder, f"{model_key}_composite_depth.npy")
-    np.save(depth_output_path, composite_depth)
-    print(f"  Composite depth: {depth_output_path}")
+    print(f"\nEdited vs GT (unchanged regions, {unchanged_mask.sum()} pixels, {unchanged_mask.mean()*100:.1f}%):")
+    print(f"  MAE:              {mae_edit_vs_gt:.4f}m")
+    print(f"  RMSE:             {rmse_edit_vs_gt:.4f}m")
+    print(f"  Max diff:         {max_diff:.4f}m")
+    print(f"  Std dev:          {std_diff:.4f}m")
+    print(f"  % diff > 0.1m:    {pct_above_01m:.2f}%")
+    print(f"  % diff > 0.5m:    {pct_above_05m:.2f}%")
 
     # Save metrics JSON
     metrics_data = {
-        'model': model_key,
-        'scaling_method': scaling_method,
-        'scale': float(scale),
-        'shift': float(shift),
-        'n_unchanged': int(n_unchanged),
-        'n_changed': int(n_changed),
-        'pct_unchanged': float(pct_unchanged),
-        'pct_changed': float(pct_changed),
-        'depth_min': float(composite_depth.min()),
-        'depth_max': float(composite_depth.max()),
-        'unchanged_match_gt': bool(unchanged_match),
-        'changed_match_pred': bool(changed_match),
+        'Scale factor': float(scale),
+        'Edit vs GT (m)': float(mae_edit_vs_gt),
+        'RMSE (m)': float(rmse_edit_vs_gt),
+        'Max diff (m)': float(max_diff),
+        'Std dev (m)': float(std_diff),
+        '% diff > 0.1m': float(pct_above_01m),
+        '% diff > 0.5m': float(pct_above_05m),
     }
 
     metrics_path = os.path.join(output_subfolder, f"{model_key}_metrics.json")
     with open(metrics_path, 'w') as f:
         json.dump(metrics_data, f, indent=2)
-    print(f"  Metrics: {metrics_path}")
+    print(f"\nMetrics saved: {metrics_path}")
 
-    # Create visualization (2x2 grid)
-    print("\nCreating visualization...")
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
-    plt.subplots_adjust(hspace=0.2, wspace=0.1)
+    # Create visualization (2x3 grid)
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9))
+    plt.subplots_adjust(hspace=0.15, wspace=0.05)
 
-    # Use consistent colormap range based on GT
+    # Row 1: Images
+    axes[0, 0].imshow(original_img)
+    axes[0, 0].set_title('Original Image', fontsize=12)
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(edited_img)
+    axes[0, 1].set_title('Edited Image', fontsize=12)
+    axes[0, 1].axis('off')
+
+    axes[0, 2].imshow(changed_mask, cmap='gray')
+    axes[0, 2].set_title(f'Changed Regions ({mask_model})', fontsize=12)
+    axes[0, 2].axis('off')
+
+    # Row 2: Depth maps + error
     vmin_depth = gt_depth.min()
     vmax_depth = gt_depth.max()
 
-    # Top-left: GT Depth
-    im0 = axes[0, 0].imshow(gt_depth, cmap='turbo', vmin=vmin_depth, vmax=vmax_depth)
-    axes[0, 0].set_title('Ground Truth Depth', fontsize=12)
-    axes[0, 0].axis('off')
-    plt.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04, label='meters')
-
-    # Top-right: Model Prediction (scaled)
-    im1 = axes[0, 1].imshow(pred_scaled, cmap='turbo', vmin=vmin_depth, vmax=vmax_depth)
-    axes[0, 1].set_title(f'{model_name} Prediction (Scaled)', fontsize=12)
-    axes[0, 1].axis('off')
-    plt.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04, label='meters')
-
-    # Bottom-left: Composite Output
-    im2 = axes[1, 0].imshow(composite_depth, cmap='turbo', vmin=vmin_depth, vmax=vmax_depth)
-    axes[1, 0].set_title('Composite Depth Output', fontsize=12)
+    im0 = axes[1, 0].imshow(gt_depth, cmap='turbo', vmin=vmin_depth, vmax=vmax_depth)
+    axes[1, 0].set_title('Ground Truth Depth', fontsize=12)
     axes[1, 0].axis('off')
-    plt.colorbar(im2, ax=axes[1, 0], fraction=0.046, pad=0.04, label='meters')
+    plt.colorbar(im0, ax=axes[1, 0], fraction=0.046, pad=0.04, label='meters')
 
-    # Bottom-right: Change Mask Overlay on edited image
-    axes[1, 1].imshow(edited_img)
-    # Create overlay: red for changed regions
-    overlay = np.zeros((*changed_mask.shape, 4))
-    overlay[changed_mask] = [1, 0, 0, 0.4]  # Red with alpha
-    axes[1, 1].imshow(overlay)
-    axes[1, 1].set_title(f'Change Mask Overlay\n({pct_changed:.1f}% changed)', fontsize=12)
+    im1 = axes[1, 1].imshow(depth_edited_scaled, cmap='turbo', vmin=vmin_depth, vmax=vmax_depth)
+    axes[1, 1].set_title(f'{model_name}\n(Edited, Scaled)', fontsize=12)
     axes[1, 1].axis('off')
+    plt.colorbar(im1, ax=axes[1, 1], fraction=0.046, pad=0.04, label='meters')
 
-    plt.suptitle(f'Composite Depth: {model_name} ({scaling_folder})', fontsize=14, fontweight='bold')
+    from scipy import ndimage
+    unchanged_mask_clean = ndimage.binary_erosion(unchanged_mask, iterations=2)
+    error_edit_signed = depth_edited_scaled - gt_depth
+    error_edit_masked = np.where(unchanged_mask_clean, error_edit_signed, np.nan)
+    error_range = 0.5
+    im2 = axes[1, 2].imshow(error_edit_masked, cmap='PuOr', vmin=-error_range, vmax=error_range)
+    axes[1, 2].set_title(f'Error: Edited - GT\n(Unchanged, MAE={mae_edit_vs_gt:.3f}m)', fontsize=12)
+    axes[1, 2].axis('off')
+    plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04, label='meters')
+
+    plt.suptitle(f'Scaled Depth: {model_name} ({scaling_folder}, mask: {mask_model})', fontsize=14, fontweight='bold')
     plt.tight_layout()
 
-    # Save visualization
-    viz_output_path = os.path.join(output_subfolder, f"{model_key}_visualization.png")
-    plt.savefig(viz_output_path, dpi=150, bbox_inches='tight')
-    print(f"  Visualization: {viz_output_path}")
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"\nFigure saved to: {output_path}")
 
     if not args.no_show:
         plt.show()
 
-    print("\n" + "=" * 70)
-    print("DONE!")
-    print("=" * 70)
-    print(f"\nOutputs saved to: {output_subfolder}/")
-    print(f"  - {model_key}_composite_depth.npy")
-    print(f"  - {model_key}_metrics.json")
-    print(f"  - {model_key}_visualization.png")
+    print("\nDone!")
 
 
 if __name__ == "__main__":
