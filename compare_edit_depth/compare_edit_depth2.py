@@ -32,9 +32,17 @@ GT_TO_CENTIMETERS = 10000.0
 AVAILABLE_DATASETS = ['depth3', 'depth4']
 
 AVAILABLE_MODELS = {
-    'depth_anything': 'Depth Anything V2 Metric',
-    'depth_pro': 'Depth Pro',
-    'metric3d': 'Metric3D v2',
+    'da2': 'DA V2 Metric',
+    'da3': 'DA3 Metric Large',
+    'da3_giant': 'DA3 Giant 1.1',
+    'da3_nested': 'DA3 Nested Giant 1.1',
+    'dpro': 'Depth Pro',
+}
+
+DA3_HF_MODELS = {
+    'da3': 'depth-anything/DA3METRIC-LARGE',
+    'da3_giant': 'depth-anything/DA3-GIANT-1.1',
+    'da3_nested': 'depth-anything/DA3NESTED-GIANT-LARGE-1.1',
 }
 
 
@@ -150,7 +158,7 @@ def load_image(path):
         return Image.open(path).convert("RGB")
 '''
 
-    if model_name == 'depth_anything':
+    if model_name == 'da2':
         script = f'''
 import torch
 import numpy as np
@@ -166,7 +174,26 @@ np.save("{output_path_safe}", depth)
 print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
 '''
 
-    elif model_name == 'depth_pro':
+    elif model_name in DA3_HF_MODELS:
+        hf_model_id = DA3_HF_MODELS[model_name]
+        script = f'''
+import torch
+import numpy as np
+from PIL import Image
+torch.set_grad_enabled(False)
+{exr_loader}
+from depth_anything_3.api import DepthAnything3
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model = DepthAnything3.from_pretrained("{hf_model_id}")
+model = model.to(device=device)
+img = load_image("{rgb_path_safe}")
+prediction = model.inference([img])
+depth = prediction.depth[0]
+np.save("{output_path_safe}", depth)
+print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
+'''
+
+    elif model_name == 'dpro':
         script = f'''
 import torch
 import numpy as np
@@ -185,35 +212,6 @@ np.save("{output_path_safe}", depth)
 print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
 '''
 
-    elif model_name == 'metric3d':
-        script = f'''
-import torch
-import numpy as np
-from PIL import Image
-from torchvision import transforms
-torch.set_grad_enabled(False)
-{exr_loader}
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = torch.hub.load("yvanyin/metric3d", "metric3d_vit_small", pretrain=True)
-model = model.to(device).eval()
-
-img = load_image("{rgb_path_safe}")
-max_size = 800
-w, h = img.size
-if max(w, h) > max_size:
-    scale = max_size / max(w, h)
-    img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
-
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-img_tensor = transform(img).unsqueeze(0).to(device)
-pred_depth, _, _ = model.inference({{"input": img_tensor}})
-depth = pred_depth.squeeze().cpu().numpy()
-np.save("{output_path_safe}", depth)
-print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
-'''
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -223,11 +221,15 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
         [python_exe, '-c', script],
         capture_output=True,
         text=True,
-        timeout=300
+        timeout=1800
     )
 
     if result.returncode != 0:
-        raise RuntimeError(f"Subprocess failed: {result.stderr}")
+        raise RuntimeError(
+            f"Subprocess failed (exit code {result.returncode}):\n"
+            f"STDOUT: {result.stdout}\n"
+            f"STDERR: {result.stderr}"
+        )
 
     return result.stdout.strip()
 
@@ -249,7 +251,7 @@ def load_change_mask(mask_model, dataset):
 
 def main():
     parser = argparse.ArgumentParser(description='Generate scaled depth map for edited image using GT-calibrated scale factor')
-    parser.add_argument('--model', type=str, default='depth_pro',
+    parser.add_argument('--model', type=str, default='dpro',
                         choices=list(AVAILABLE_MODELS.keys()),
                         help=f'Model to use: {list(AVAILABLE_MODELS.keys())}')
     parser.add_argument('--scaling', type=str, default='ls',

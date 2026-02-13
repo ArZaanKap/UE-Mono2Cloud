@@ -14,6 +14,8 @@ pointclouds/
 
 # Third-party repos
 Robust-Scene-Change-Detection/
+Depth-Anything-3/
+pixel-perfect-depth/
 
 # Junk files
 nul
