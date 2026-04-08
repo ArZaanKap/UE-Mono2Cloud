@@ -5,94 +5,119 @@ Turn AI-edited room images into 3D point clouds using monocular depth estimation
 ## Workflow
 
 ```
-UE Scene → Export RGB + GT Depth (EXR)
-                    ↓
-         AI edits the RGB image
-                    ↓
-      Detect changed regions (GeSCF / DINOv2)
-                    ↓
-      Run depth model on edited image
-                    ↓
-      Calibrate prediction → GT via unchanged regions
-                    ↓
-      Generate colored point cloud (.las)
+UE scene -> export RGB + GT depth (EXR)
+         -> edit the RGB image
+         -> detect changed regions
+         -> run a monocular depth model on the edited image
+         -> fit prediction to GT on unchanged regions
+         -> back-project to a coloured point cloud (.las)
 ```
 
-## Project Structure
+## Repo Guide
 
-| File | What it does |
+| Path | What it does |
 |------|--------------|
-| `img_to_pointcloud.ipynb` | End-to-end pipeline: change detection, depth estimation (Depth Pro), least-squares calibration, LAS export |
-| `compare_edit_depth/compare_edit_depth.py` | Evaluate depth consistency — runs model on original + edited image, scales from **original**, reports metrics on unchanged regions |
-| `compare_edit_depth/compare_edit_depth2.py` | Same evaluation but scales from **edited image** unchanged regions instead |
-| `compare_all_models.py` | Benchmark depth models (Depth Pro, Depth Anything V2, Metric3D v2) against GT |
-| `change_detection_results/test_change_detection.py` | Compare change detection methods: RGB threshold, DINOv2, GeSCF (SAM Q/K/V), DINOv2+CrossAttn |
-| `analyze_depth.py` | Inspect EXR depth files — verify channels, units, and `GT_TO_CENTIMETERS` |
+| `img_to_pointcloud.ipynb` | Main notebook pipeline using Depth Pro for edited-image depth, GT-based calibration, and LAS export |
+| `img_to_pointcloud2.ipynb` | Newer notebook variant using Depth Anything 3 (`da3_giant` / `da3_nested`) instead of Depth Pro |
+| `mask_tests.ipynb` | Experimental notebook for tuning GeSCF-style change masks and thin-structure recovery |
+| `compare_edit_depth/compare_edit_depth.py` | Evaluate depth consistency by scaling from the original-image prediction, then comparing original vs edited depth on unchanged regions |
+| `compare_edit_depth/compare_edit_depth2.py` | Evaluate edited-image depth only, scaling from unchanged edited pixels vs GT |
+| `compare_edit_depth/pipeline_difference.md` | Short note describing the difference between the two comparison scripts |
+| `change_detection_results/test_change_detection.py` | Compare change-detection methods: RGB threshold, DINOv2 features, GeSCF-style SAM features, and pretrained DINOv2 + cross-attention |
+| `analyze_depth.py` | Verify EXR depth channels and confirm the `GT_TO_CENTIMETERS` conversion for UE `SceneDepth` files |
+| `data_analysis_report.txt` | Earlier analysis notes on Unreal depth formats and model alignment |
+| `Depth-Anything-3/` | Vendored third-party repo used by the DA3 notebook and `compare_edit_depth2.py` |
+| `Robust-Scene-Change-Detection/` | Vendored third-party repo used by the optional cross-attention change-detection baseline |
+
+## Current State
+
+- The end-to-end point-cloud workflow lives in notebooks, not in a packaged Python module.
+- The Depth Pro path is in `img_to_pointcloud.ipynb`.
+- The newer Depth Anything 3 path is in `img_to_pointcloud2.ipynb`.
+- The scripted evaluation flow is centered on the `depth3` and `depth4` datasets.
+- The notebooks currently use `test*` datasets, while the comparison scripts use `depth*` datasets.
 
 ## Depth Calibration
 
-Monocular depth models output relative or coarsely-metric depth. We align predictions to UE ground truth using least-squares fitting on unchanged regions:
+Monocular depth predictions are aligned to UE ground truth with a linear fit on unchanged pixels:
 
-```
+```python
 depth_calibrated = prediction * scale + shift
 ```
 
-The change detection mask (GeSCF by default) identifies which pixels were not modified by the AI edit, so only those are used for fitting.
+The unchanged region mask comes from precomputed change-detection results, usually `gescf_{dataset}_mask.npy` or `dinov2_{dataset}_mask.npy` in `change_detection_results/{dataset}/`.
+
+GT depth conversion for Unreal `SceneDepth.exr` files is:
+
+```python
+depth_meters = raw_value * 10000 / 100
+```
 
 ## Metrics
 
-All evaluation scripts report metrics **in meters on unchanged regions**:
+The comparison scripts report metrics in meters on unchanged regions.
 
 | Metric | Description |
 |--------|-------------|
-| MAE | Mean absolute error between prediction and GT |
-| RMSE | Root mean square error (penalises large errors) |
-| Edit vs GT MAE | How well the edited prediction matches GT after scaling |
-| Orig vs GT MAE | Baseline — how well the original prediction matches GT |
-| % > 0.1m / 0.5m | Fraction of pixels with error above threshold |
+| `Orig vs GT MAE` | Baseline error for the original-image prediction after scaling |
+| `Edit vs GT MAE` | Error for the edited-image prediction after scaling |
+| `MAE` | Mean absolute difference between original and edited predictions on unchanged pixels |
+| `RMSE` | Root mean square error |
+| `% > 0.1m / 0.5m` | Fraction of unchanged pixels above the given error threshold |
 
-`compare_edit_depth` saves results to JSON + markdown tables per model. `img_to_pointcloud` prints MAE/RMSE to console only.
+`compare_edit_depth` writes JSON and markdown summaries per model. The notebooks print summary metrics inline and export LAS files.
 
 ## Data Layout
 
 ```
 data/
-  depth3/                         # Test scene 1
-  depth4/                         # Test scene 2
-    HighresScreenshot00000.exr        # Original RGB (EXR, linear)
-    HighresScreenshot00000_SceneDepth.exr  # GT depth
-    *edit*.png                        # AI-edited image
-change_detection_results/
-  {dataset}/
-    gescf_{dataset}_mask.npy          # Pre-computed change masks
-weights/
-  sam_vit_b_01ec64.pth              # SAM weights (auto-downloaded)
-```
+  depth3/
+  depth4/
+  test1/
+  test2/
+  ...
+    HighresScreenshot00000.exr
+    HighresScreenshot00000_SceneDepth.exr
+    *edit*.png
 
-GT depth conversion: `depth_meters = raw_value * 10000 / 100`
+change_detection_results/
+  depth3/
+  depth4/
+    gescf_{dataset}_mask.npy
+    dinov2_{dataset}_mask.npy
+    summary_{dataset}.png
+
+weights/
+  sam_vit_b_01ec64.pth
+
+pointclouds/
+pointclouds2/
+```
 
 ## Quick Start
 
-```python
-# img_to_pointcloud.ipynb
-DATASET = "depth4"
-CAMERA_FOV = 90.0
-GT_TO_CENTIMETERS = 10000.0
-```
-
 ```bash
-# Compare depth consistency across models
-python compare_edit_depth/compare_edit_depth.py --model depth_pro --dataset depth4
-
-# Run change detection
+# Run change detection for a dataset
 python change_detection_results/test_change_detection.py --dataset depth4
 
-# Benchmark models against GT
-python compare_all_models.py
+# Compare original vs edited depth (scale learned from original prediction)
+python compare_edit_depth/compare_edit_depth.py --model depth_pro --dataset depth4 --mask-model gescf
+
+# Compare edited-image depth only (scale learned from unchanged edited pixels)
+python compare_edit_depth/compare_edit_depth2.py --model dpro --dataset depth4 --mask-model gescf
 ```
 
-## Requirements
+Notebook config lives at the top of each notebook. The main settings are `DATASET`, `CAMERA_FOV`, `GT_TO_CENTIMETERS`, and the chosen depth model variant.
 
-- Python 3.10+, PyTorch + CUDA
-- `depth_pro`, `segment-anything`, `transformers`
-- `OpenEXR`, `laspy`, `scipy`, `opencv-python`
+## Dependencies
+
+There is no pinned environment file in this repo yet. Based on current imports, the project expects:
+
+- Python 3.10+
+- PyTorch
+- `OpenEXR`, `Imath`, `Pillow`, `numpy`, `scipy`, `opencv-python`, `matplotlib`, `laspy`
+- `depth_pro`
+- `segment-anything`
+- `transformers`
+- The vendored `Depth-Anything-3/` repo for DA3 experiments
+- The vendored `Robust-Scene-Change-Detection/` repo for the optional cross-attention baseline

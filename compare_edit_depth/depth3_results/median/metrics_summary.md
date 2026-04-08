@@ -8,9 +8,9 @@ computed from the **original image only**. The same scale factor is then applied
 and edited predictions. This ensures fair comparison across models with different output scales.
 
 ### Unchanged Regions
-A pixel is considered **unchanged** if the mean absolute RGB difference between the original
-and edited image is **<= 10** (on a 0-255 scale). This threshold identifies regions where
-the edit did not visually modify the image.
+Unchanged pixels are taken from the selected pre-computed change mask
+(`dinov2` or `gescf`) loaded from `change_detection_results/{dataset}/`.
+Metrics are reported on the complement of that mask.
 
 ### What We're Measuring
 For a perfectly consistent depth model, unchanged regions should produce **identical depth
