@@ -1,35 +1,15 @@
-# Pipeline Difference: v1 vs v2
+# v1 vs v2
 
-Both are test scripts to evaluate calibration strategies for the main pipeline (img -> depth -> point cloud).
-Both use pre-computed change masks from `change_detection_results/` (toggle with `--mask-model dinov2|gescf`).
+## v1 — `compare_edit_depth.py`
+Runs the model on the **original** image. Fits scale to original prediction vs GT across all pixels. Applies the same scale to the edited prediction.
 
-**v1 (`compare_edit_depth.py`)** — Calibrate on original image.
-Fits original prediction to GT (all pixels) to get scale factor, applies same factor to edited prediction.
+**Problem:** unrealistic — in production you only have the edited image.
 
-**v2 (`compare_edit_depth2.py`)** — Calibrate on edited image (unchanged regions only).
-Fits edited prediction to GT using unchanged pixels only, applies that factor to both predictions.
+## v2 — `compare_edit_depth2.py` (use this)
+Runs the model on the **edited** image only. Fits scale to the edited prediction vs GT, but **only on unchanged pixels** (from the pre-computed `.npy` mask).
 
-## Output comparison
+This is the realistic scenario: one image, one model run, calibrate on what you know is still correct.
 
-**v1** (3x3 grid) — runs model on both images:
+---
 
-| Row | Left | Centre | Right |
-|-----|------|--------|-------|
-| 1 | Original image | Edited image | Change mask |
-| 2 | GT depth | Pred original (scaled) | Pred edited (scaled) |
-| 3 | Depth diff (unchanged) | Error: original - GT | Error: edited - GT |
-
-**v2** (2x3 grid) — runs model on edited image only:
-
-| Row | Left | Centre | Right |
-|-----|------|--------|-------|
-| 1 | Original image | Edited image | Change mask |
-| 2 | GT depth | Pred edited (scaled) | Error: edited - GT |
-
-**Comparable metric**: "Edit vs GT MAE" (unchanged regions) — same measurement, different scaling.
-
-| | v1 | v2 |
-|---|---|---|
-| Scale source | original pred vs GT (all pixels) | edited pred vs GT (unchanged only) |
-| Model runs | 2 (original + edited) | 1 (edited only) |
-| Output folder | `{dataset}_results/` | `{dataset}_results2/` |
+The "Edit vs GT MAE" metric means the same thing in both — error on unchanged pixels after scaling. v2 just learns the scale from the right source.

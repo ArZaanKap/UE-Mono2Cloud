@@ -179,9 +179,14 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
         script = f'''
 import torch
 import numpy as np
+import sys
+from pathlib import Path
 from PIL import Image
 torch.set_grad_enabled(False)
 {exr_loader}
+da3_src = Path(r"{PROJECT_ROOT}") / "Depth-Anything-3" / "src"
+if da3_src.exists() and str(da3_src) not in sys.path:
+    sys.path.insert(0, str(da3_src))
 from depth_anything_3.api import DepthAnything3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = DepthAnything3.from_pretrained("{hf_model_id}")
