@@ -18,15 +18,18 @@ import tempfile
 import argparse
 import numpy as np
 import pandas as pd
+import matplotlib
 from PIL import Image
-import matplotlib.pyplot as plt
 import OpenEXR
 import Imath
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # Parent directory (UE_depth)
-OUTPUT_FOLDER = SCRIPT_DIR  # Output to same folder as script
+OUTPUT_FOLDER = os.path.join(SCRIPT_DIR, "v1")
 GT_TO_CENTIMETERS = 10000.0
 
 AVAILABLE_DATASETS = ['depth3', 'depth4']
@@ -273,7 +276,7 @@ def main():
     dataset = args.dataset
     input_folder = os.path.join(PROJECT_ROOT, "data", dataset)
 
-    # Create output subfolder: compare_edit_depth/{dataset}_results/{scaling}/
+    # Create output subfolder: compare_edit_depth/v1/{dataset}_results/{scaling}/
     output_subfolder = os.path.join(OUTPUT_FOLDER, f"{dataset}_results", scaling_folder)
     os.makedirs(output_subfolder, exist_ok=True)
 
@@ -288,7 +291,7 @@ def main():
     print(f"Scaling: {scaling_folder}")
     print(f"Dataset: {dataset}")
     print(f"Mask model: {args.mask_model}")
-    print(f"Output: {dataset}_results/{scaling_folder}/{output_filename}")
+    print(f"Output: v1/{dataset}_results/{scaling_folder}/{output_filename}")
 
     # Find files
     original_path, edited_path, gt_depth_path = find_files(input_folder)

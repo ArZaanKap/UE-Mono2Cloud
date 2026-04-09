@@ -18,16 +18,20 @@ import tempfile
 import argparse
 import json
 import numpy as np
+import matplotlib
 from PIL import Image
-import matplotlib.pyplot as plt
 import OpenEXR
 import Imath
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Configuration
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # Parent directory (UE_depth)
-OUTPUT_FOLDER = SCRIPT_DIR  # Output to same folder as script
+OUTPUT_FOLDER = os.path.join(SCRIPT_DIR, "v2")
 GT_TO_CENTIMETERS = 10000.0
+MARIGOLD_MAX_RESOLUTION = 768
 
 AVAILABLE_DATASETS = ['depth3', 'depth4']
 
@@ -37,6 +41,7 @@ AVAILABLE_MODELS = {
     'da3_giant': 'DA3 Giant 1.1',
     'da3_nested': 'DA3 Nested Giant 1.1',
     'dpro': 'Depth Pro',
+    'marigold_dc': 'Marigold-DC',
 }
 
 DA3_HF_MODELS = {
@@ -126,10 +131,44 @@ def find_files(folder):
     return original_rgb, edited_rgb, depth_gt
 
 
-def run_model_subprocess(model_name, rgb_path, output_path):
+def run_model_subprocess(model_name, rgb_path, output_path, sparse_depth_path=None):
     """Run a depth model in a separate subprocess."""
     rgb_path_safe = rgb_path.replace('\\', '/')
     output_path_safe = output_path.replace('\\', '/')
+    python_exe = sys.executable
+
+    if model_name == 'marigold_dc':
+        marigold_repo = os.path.join(PROJECT_ROOT, "Marigold-DC")
+        if not os.path.isdir(marigold_repo):
+            raise FileNotFoundError(
+                f"Marigold-DC repo not found at: {marigold_repo}\n"
+                "Clone https://github.com/prs-eth/Marigold-DC into the project root first."
+            )
+        if sparse_depth_path is None:
+            raise ValueError("Marigold-DC requires a sparse_depth_path")
+
+        result = subprocess.run(
+            [
+                python_exe, '-m', 'marigold_dc',
+                '--in-image', rgb_path,
+                '--in-depth', sparse_depth_path,
+                '--out-depth', output_path,
+                '--processing_resolution', '0',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+            cwd=marigold_repo,
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Subprocess failed (exit code {result.returncode}):\n"
+                f"STDOUT: {result.stdout}\n"
+                f"STDERR: {result.stderr}"
+            )
+
+        return result.stdout.strip()
 
     exr_loader = '''
 def load_exr_rgb(path):
@@ -220,8 +259,6 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
-    python_exe = sys.executable
-
     result = subprocess.run(
         [python_exe, '-c', script],
         capture_output=True,
@@ -254,6 +291,30 @@ def load_change_mask(mask_model, dataset):
     return mask.astype(bool)
 
 
+def build_sparse_guidance(gt_depth, unchanged_mask):
+    """Build sparse metric depth input for Marigold-DC."""
+    valid_guidance = (
+        unchanged_mask
+        & (gt_depth > 0.1)
+        & (gt_depth < 100)
+        & np.isfinite(gt_depth)
+    )
+    sparse_guidance = np.where(valid_guidance, gt_depth, 0.0).astype(np.float32)
+    return sparse_guidance, valid_guidance
+
+
+def get_processing_shape(height, width, max_resolution):
+    """Resize to a Marigold-friendly shape with longest side <= max_resolution."""
+    longest_side = max(height, width)
+    if longest_side <= max_resolution:
+        return height, width
+
+    scale = max_resolution / longest_side
+    resized_height = max(8, int(round((height * scale) / 8.0) * 8))
+    resized_width = max(8, int(round((width * scale) / 8.0) * 8))
+    return resized_height, resized_width
+
+
 def main():
     parser = argparse.ArgumentParser(description='Generate scaled depth map for edited image using GT-calibrated scale factor')
     parser.add_argument('--model', type=str, default='dpro',
@@ -261,7 +322,7 @@ def main():
                         help=f'Model to use: {list(AVAILABLE_MODELS.keys())}')
     parser.add_argument('--scaling', type=str, default='ls',
                         choices=['median', 'ls'],
-                        help='Scaling method: median or ls (least_squares)')
+                        help='Scaling method: median or ls (least_squares); ignored for marigold_dc')
     parser.add_argument('--dataset', type=str, default='depth4',
                         choices=AVAILABLE_DATASETS,
                         help=f'Dataset to use: {AVAILABLE_DATASETS}')
@@ -275,12 +336,12 @@ def main():
     model_key = args.model
     model_name = AVAILABLE_MODELS[model_key]
     scaling_method = args.scaling
-    scaling_folder = 'median' if scaling_method == 'median' else 'least_squares'
+    scaling_folder = 'guided_completion' if model_key == 'marigold_dc' else ('median' if scaling_method == 'median' else 'least_squares')
     mask_model = args.mask_model
     dataset = args.dataset
     input_folder = os.path.join(PROJECT_ROOT, "data", dataset)
 
-    # Create output subfolder: compare_edit_depth/{dataset}_results2/{scaling}/
+    # Create output subfolder: compare_edit_depth/v2/{dataset}_results2/{scaling}/
     output_subfolder = os.path.join(OUTPUT_FOLDER, f"{dataset}_results2", scaling_folder)
     os.makedirs(output_subfolder, exist_ok=True)
 
@@ -295,7 +356,7 @@ def main():
     print(f"Scaling: {scaling_folder}")
     print(f"Mask model: {mask_model}")
     print(f"Dataset: {dataset}")
-    print(f"Output: {dataset}_results2/{scaling_folder}/{output_filename}")
+    print(f"Output: v2/{dataset}_results2/{scaling_folder}/{output_filename}")
 
     # Find files
     original_path, edited_path, gt_depth_path = find_files(input_folder)
@@ -325,6 +386,23 @@ def main():
     print(f"GT depth shape: {gt_depth.shape}")
     print(f"GT depth range: {gt_depth.min():.2f}m - {gt_depth.max():.2f}m")
 
+    # Load pre-computed change mask from change_detection_results/
+    print(f"\nLoading change mask (model: {mask_model})...")
+    changed_mask = load_change_mask(mask_model, dataset)
+
+    target_shape = gt_depth.shape
+
+    # Resize mask to match GT if needed
+    if changed_mask.shape != target_shape:
+        changed_mask = np.array(Image.fromarray(changed_mask.astype(np.uint8) * 255).resize(
+            (target_shape[1], target_shape[0]), Image.NEAREST)) > 127
+
+    unchanged_mask = ~changed_mask
+    sparse_guidance, valid_guidance_mask = build_sparse_guidance(gt_depth, unchanged_mask)
+
+    if valid_guidance_mask.sum() == 0:
+        raise ValueError("No valid unchanged GT pixels available to build sparse guidance")
+
     # Run model on EDITED image only
     print("\n" + "-" * 50)
     print(f"Running {model_name} on EDITED image...")
@@ -332,16 +410,47 @@ def main():
     with tempfile.NamedTemporaryFile(suffix='.npy', delete=False) as f:
         output_edited = f.name
 
+    sparse_guidance_path = None
+    marigold_image_path = None
     try:
-        output = run_model_subprocess(model_key, edited_path, output_edited)
-        print(f"  {output}")
+        if model_key == 'marigold_dc':
+            marigold_height, marigold_width = get_processing_shape(
+                target_shape[0], target_shape[1], MARIGOLD_MAX_RESOLUTION
+            )
+            marigold_guidance = sparse_guidance
+            if (marigold_height, marigold_width) != target_shape:
+                marigold_guidance = np.array(
+                    Image.fromarray(sparse_guidance).resize((marigold_width, marigold_height), Image.NEAREST),
+                    dtype=np.float32,
+                )
+            with tempfile.NamedTemporaryFile(suffix='.npy', delete=False) as f:
+                sparse_guidance_path = f.name
+            np.save(sparse_guidance_path, marigold_guidance)
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                marigold_image_path = f.name
+            edited_img.resize((marigold_width, marigold_height), Image.BILINEAR).save(marigold_image_path)
+            print(f"  Marigold input size: {marigold_width}x{marigold_height}")
+            print(f"  Sparse guidance pixels: {np.count_nonzero(marigold_guidance):,}")
+            output = run_model_subprocess(
+                model_key,
+                marigold_image_path,
+                output_edited,
+                sparse_depth_path=sparse_guidance_path,
+            )
+        else:
+            output = run_model_subprocess(model_key, edited_path, output_edited)
+        if output:
+            print(f"  {output}")
         depth_edited = np.load(output_edited)
     finally:
         if os.path.exists(output_edited):
             os.remove(output_edited)
+        if sparse_guidance_path and os.path.exists(sparse_guidance_path):
+            os.remove(sparse_guidance_path)
+        if marigold_image_path and os.path.exists(marigold_image_path):
+            os.remove(marigold_image_path)
 
     # Resize prediction to match GT if needed
-    target_shape = gt_depth.shape
     if depth_edited.shape != target_shape:
         depth_edited = np.array(Image.fromarray(depth_edited.astype(np.float32)).resize(
             (target_shape[1], target_shape[0]), Image.BILINEAR))
@@ -350,37 +459,32 @@ def main():
     if edited_img.size != original_img.size:
         edited_img = edited_img.resize(original_img.size, Image.BILINEAR)
 
-    # Load pre-computed change mask from change_detection_results/
-    print(f"\nLoading change mask (model: {mask_model})...")
-    changed_mask = load_change_mask(mask_model, dataset)
-
-    # Resize mask to match GT if needed
-    if changed_mask.shape != target_shape:
-        changed_mask = np.array(Image.fromarray(changed_mask.astype(np.uint8) * 255).resize(
-            (target_shape[1], target_shape[0]), Image.NEAREST)) > 127
-
-    unchanged_mask = ~changed_mask
-
     # Scale edited prediction using UNCHANGED REGIONS vs GT
     # (This is the key difference from v1, which scales using the original prediction)
     print("\n" + "-" * 50)
-    print("Computing scale factor from EDITED prediction (unchanged regions)...")
-
-    valid_mask = unchanged_mask & (gt_depth > 0.1) & (gt_depth < 100) & np.isfinite(depth_edited) & np.isfinite(gt_depth)
-    pred_valid = depth_edited[valid_mask].flatten()
-    gt_valid = gt_depth[valid_mask].flatten()
-
-    if scaling_method == 'median':
-        scale = np.median(gt_valid) / np.median(pred_valid)
+    if model_key == 'marigold_dc':
+        print("Skipping scale fit: Marigold-DC already uses sparse GT depths during inference.")
+        scale = 1.0
         shift = 0.0
-        depth_edited_scaled = depth_edited * scale
-        print(f"Scaling (median from edited unchanged): scale={scale:.4f}")
+        depth_edited_scaled = depth_edited
     else:
-        A = np.vstack([pred_valid, np.ones_like(pred_valid)]).T
-        result = np.linalg.lstsq(A, gt_valid, rcond=None)
-        scale, shift = result[0]
-        depth_edited_scaled = depth_edited * scale + shift
-        print(f"Scaling (least_squares from edited unchanged): scale={scale:.4f}, shift={shift:.4f}")
+        print("Computing scale factor from EDITED prediction (unchanged regions)...")
+
+        valid_mask = unchanged_mask & (gt_depth > 0.1) & (gt_depth < 100) & np.isfinite(depth_edited) & np.isfinite(gt_depth)
+        pred_valid = depth_edited[valid_mask].flatten()
+        gt_valid = gt_depth[valid_mask].flatten()
+
+        if scaling_method == 'median':
+            scale = np.median(gt_valid) / np.median(pred_valid)
+            shift = 0.0
+            depth_edited_scaled = depth_edited * scale
+            print(f"Scaling (median from edited unchanged): scale={scale:.4f}")
+        else:
+            A = np.vstack([pred_valid, np.ones_like(pred_valid)]).T
+            result = np.linalg.lstsq(A, gt_valid, rcond=None)
+            scale, shift = result[0]
+            depth_edited_scaled = depth_edited * scale + shift
+            print(f"Scaling (least_squares from edited unchanged): scale={scale:.4f}, shift={shift:.4f}")
 
     # Metrics: how well does scaled edited prediction match GT in unchanged regions?
     edit_unchanged = depth_edited_scaled[unchanged_mask]
@@ -409,7 +513,10 @@ def main():
 
     # Save metrics JSON
     metrics_data = {
+        'Scaling method': 'guided_completion' if model_key == 'marigold_dc' else scaling_folder,
         'Scale factor': float(scale),
+        'Shift': float(shift),
+        'Guidance pixels': int(valid_guidance_mask.sum()),
         'Edit vs GT (m)': float(mae_edit_vs_gt),
         'RMSE (m)': float(rmse_edit_vs_gt),
         'Max diff (m)': float(max_diff),
@@ -450,7 +557,8 @@ def main():
     plt.colorbar(im0, ax=axes[1, 0], fraction=0.046, pad=0.04, label='meters')
 
     im1 = axes[1, 1].imshow(depth_edited_scaled, cmap='turbo', vmin=vmin_depth, vmax=vmax_depth)
-    axes[1, 1].set_title(f'{model_name}\n(Edited, Scaled)', fontsize=12)
+    depth_title_suffix = 'Edited, Dense Depth' if model_key == 'marigold_dc' else 'Edited, Scaled'
+    axes[1, 1].set_title(f'{model_name}\n({depth_title_suffix})', fontsize=12)
     axes[1, 1].axis('off')
     plt.colorbar(im1, ax=axes[1, 1], fraction=0.046, pad=0.04, label='meters')
 
@@ -464,7 +572,8 @@ def main():
     axes[1, 2].axis('off')
     plt.colorbar(im2, ax=axes[1, 2], fraction=0.046, pad=0.04, label='meters')
 
-    plt.suptitle(f'Scaled Depth: {model_name} ({scaling_folder}, mask: {mask_model})', fontsize=14, fontweight='bold')
+    figure_prefix = 'Dense Depth' if model_key == 'marigold_dc' else 'Scaled Depth'
+    plt.suptitle(f'{figure_prefix}: {model_name} ({scaling_folder}, mask: {mask_model})', fontsize=14, fontweight='bold')
     plt.tight_layout()
 
     plt.savefig(output_path, dpi=150, bbox_inches='tight')

@@ -1,0 +1,31 @@
+# Install a matching PyTorch build for your machine first if you need CUDA:
+# https://pytorch.org/get-started/locally/
+#
+# Then install the rest with:
+#   pip install -r requirements.txt
+#
+# This file covers the public pip-installable dependencies used by the
+# tracked scripts and notebooks in this repo. It does not include:
+# - large model weights in checkpoints/ and weights/
+# - gitignored third-party repos such as Depth-Anything-3/
+# - gitignored third-party repos such as Robust-Scene-Change-Detection/
+
+torch>=2.5,<2.7
+torchvision>=0.20,<0.22
+numpy<2
+scipy
+matplotlib
+pillow
+opencv-python
+OpenEXR
+laspy
+pandas
+plotly
+transformers
+huggingface_hub
+depth-pro==0.1
+segment-anything
+einops
+requests
+pyyaml
+jupyter

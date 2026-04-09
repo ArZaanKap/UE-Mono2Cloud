@@ -4,8 +4,10 @@ The two main notebooks take a UE render + edited image and produce a coloured `.
 
 | Notebook | Depth model | Output folder |
 |---|---|---|
-| `img_to_pointcloud.ipynb` | Depth Pro | `pointclouds/` |
-| `img_to_pointcloud2.ipynb` | Depth Anything 3 (DA3 Giant / DA3 Nested) | `pointclouds2/` |
+| `MAIN_TEST/img_to_pointcloud_depth_pro.ipynb` | Depth Pro | `MAIN_TEST/pointclouds_depth_pro/` |
+| `MAIN_TEST/img_to_pointcloud_depth_pro_legacy.ipynb` | Depth Pro (legacy variant) | `MAIN_TEST/pointclouds_depth_pro_legacy/` |
+| `MAIN_TEST/img_to_pointcloud_da3.ipynb` | Depth Anything 3 (DA3 Giant / DA3 Nested) | `MAIN_TEST/pointclouds_da3/` |
+| `MAIN_TEST/img_to_pointcloud_marigold.py` | Marigold-DC | `MAIN_TEST/pointclouds_marigold/` |
 
 Both follow the same pipeline. Depth Pro currently gives better results (lower RMSE). DA3 is the newer alternative.
 
@@ -19,7 +21,7 @@ CAMERA_FOV       = 90            # degrees — matches UE scene camera
 GT_TO_CENTIMETERS = 10000.0      # for SceneDepth.exr files (do not change)
 ```
 
-For `img_to_pointcloud2.ipynb` also set:
+For `MAIN_TEST/img_to_pointcloud_da3.ipynb` also set:
 ```python
 MODEL_VARIANT = "da3_giant"      # or "da3_nested"
 ```
@@ -33,7 +35,9 @@ MODEL_VARIANT = "da3_giant"      # or "da3_nested"
 2. Sky detection      — find sky threshold from GT depth histogram
 3. Change detection   — GeSCF mask: which pixels changed vs original
 4. Depth prediction   — run model on edited image
-5. Calibration        — least-squares fit on unchanged pixels → scale + shift
+5. Calibration / completion
+   Depth Pro / DA3: least-squares fit on unchanged pixels → scale + shift
+   Marigold-DC: sparse-guided depth completion with UE GT on unchanged pixels
 6. Point cloud        — back-project, sky filter, colour, export .las
 ```
 

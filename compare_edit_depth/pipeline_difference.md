@@ -5,10 +5,14 @@ Runs the model on the **original** image. Fits scale to original prediction vs G
 
 **Problem:** unrealistic — in production you only have the edited image.
 
+Results now live under `compare_edit_depth/v1/`.
+
 ## v2 — `compare_edit_depth2.py` (use this)
 Runs the model on the **edited** image only. Fits scale to the edited prediction vs GT, but **only on unchanged pixels** (from the pre-computed `.npy` mask).
 
 This is the realistic scenario: one image, one model run, calibrate on what you know is still correct.
+
+Results now live under `compare_edit_depth/v2/`.
 
 ---
 

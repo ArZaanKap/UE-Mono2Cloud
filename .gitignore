@@ -1,25 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+.jupyter_runtime/
+
 # Models
 *.pt
 *.pth
 checkpoints/
 weights/
 
-# Data and Results
+# Data and generated outputs
 *.exr
 *.npy
 *.las
 data/
 output/
 pointclouds/
+MAIN_TEST/pointclouds_*/
+compare_edit_depth/v1/
+compare_edit_depth/v2/
 
 # Third-party repos
 Robust-Scene-Change-Detection/
 Depth-Anything-3/
+Marigold-DC/
 pixel-perfect-depth/
 
-# Junk files
+# OS/editor junk
+.DS_Store
+Thumbs.db
 nul
 _ul
 
-# Local Settings
+# Local settings
 .claude/

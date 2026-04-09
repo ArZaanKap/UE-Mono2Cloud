@@ -1,6 +1,9 @@
 # TODO — Next Steps
 
-Current best: **Depth Pro + GeSCF mask + least-squares → MAE 4.2cm, RMSE 6.5cm** (`data/depth4`)
+Best monocular baseline: **Depth Pro + GeSCF mask + least-squares → MAE 4.2cm, RMSE 6.5cm** (`data/depth4`)
+
+Best sparse-guided result so far: **Marigold-DC + GeSCF sparse UE guide → MAE ~1.6–1.7cm, RMSE ~3.7–4.1cm** on unchanged regions (`data/depth4`).
+Important caveat: those unchanged pixels are also the guidance signal, so this is not a like-for-like comparison with monocular + least-squares.
 
 ---
 
@@ -8,18 +11,22 @@ Current best: **Depth Pro + GeSCF mask + least-squares → MAE 4.2cm, RMSE 6.5cm
 
 The literature frames our problem as **"depth completion with partial GT"** rather than monocular depth + post-hoc scale/shift. The edited pixels have no GT anchor; diffusion-based models can propagate geometry from surrounding known-depth pixels in a structure-preserving way that least-squares cannot.
 
-### Marigold-DC ← try this first
+### Marigold-DC ← tried
 - **Paper:** arxiv:2412.13389 (ICCV 2025)
 - **Code:** https://github.com/prs-eth/Marigold-DC
 - **What it does:** Diffusion depth completion with sparse GT as test-time guidance. Input: RGB + sparse known depths. Output: dense metric depth consistent with known regions.
 - **How to plug in:** Feed unchanged-pixel GT depths (from UE) as sparse guide + edited RGB image → get dense depth for all pixels. Replaces steps 4–5 of current pipeline entirely.
 - **No retraining needed — zero-shot.**
+- **Status:** Integrated into `compare_edit_depth/compare_edit_depth2.py` as `--model marigold_dc` and added end-to-end pipeline `MAIN_TEST/img_to_pointcloud_marigold.py`.
+- **Bring-up notes:** Needed RGB-only input, matched RGB/depth guide sizes, and a 768px long-edge cap on this 8 GB GPU.
+- **Next check:** visually review changed regions / point clouds and try ablations (`native`, `scale-only`, `scale+shift`) if we want to test whether any post-fit helps.
 
 ### DepthLab ← try second
 - **Paper:** arxiv:2412.18153
 - **Site:** https://johanan528.github.io/depthlab_web/
 - **What it does:** Dual-branch diffusion — one branch reads RGB, one reads the known-depth region. Trained on Hypersim (synthetic indoor, close to UE renders).
 - **Same drop-in role as Marigold-DC.** Benchmark both.
+- **Now the main next model to test.**
 
 ### Depth Anything with Any Prior ← try third
 - **Paper:** ICLR 2026 (OpenReview)
@@ -47,8 +54,9 @@ Even with current least-squares approach, more accurate unchanged-pixel masks gi
 
 - Delete: `data/depth5/`, `data/mrq2/` (unused datasets)
 - Delete: `main.txt`, `data_analysis_report.txt` (old notes, superseded by `.md` versions)
-- Rename: `pointclouds/` → `output/depth_pro/`, `pointclouds2/` → `output/depth_anything_3/`
+- Point-cloud outputs have been reorganized under `MAIN_TEST/` with model-specific folders (`pointclouds_depth_pro/`, `pointclouds_da3/`, `pointclouds_marigold/`)
 - `compare_edit_depth` scripts: add `--mask-path` arg so they aren't hard-coded to `.npy` files (Option B)
+- Compare Marigold point clouds qualitatively against Depth Pro / DA3 on inserted objects, not just unchanged-region metrics
 
 ---
 

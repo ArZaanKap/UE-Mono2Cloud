@@ -33,7 +33,8 @@ UE render ──► RGB image (.exr)  +  Ground truth depth (.exr)
 
 | If you want to... | Go to |
 |---|---|
-| Generate a point cloud from an edited image | `img_to_pointcloud.ipynb` (Depth Pro) or `img_to_pointcloud2.ipynb` (DA3) |
+| Generate a point cloud from an edited image | `MAIN_TEST/img_to_pointcloud_depth_pro.ipynb` (Depth Pro) or `MAIN_TEST/img_to_pointcloud_da3.ipynb` (DA3) |
+| Generate a point cloud with sparse UE depth guidance | `MAIN_TEST/img_to_pointcloud_marigold.ipynb` |
 | Understand change detection and compare methods | `change_detection_results/` |
 | Evaluate how well the depth calibration works | `compare_edit_depth/` |
 | Understand the dataset format | `data/README.md` |
@@ -46,16 +47,21 @@ UE render ──► RGB image (.exr)  +  Ground truth depth (.exr)
 ```
 UE_depth/
 │
-├── img_to_pointcloud.ipynb       # Main pipeline — Depth Pro model
-├── img_to_pointcloud2.ipynb      # Alternative pipeline — Depth Anything 3
+├── MAIN_TEST/
+│   ├── img_to_pointcloud_depth_pro.ipynb          # Main Depth Pro notebook
+│   ├── img_to_pointcloud_depth_pro_legacy.ipynb   # Older Depth Pro variant
+│   ├── img_to_pointcloud_da3.ipynb                # DA3 notebook
+│   ├── img_to_pointcloud_marigold.ipynb           # Marigold-DC pipeline
+│   ├── pointclouds_depth_pro/                     # Depth Pro outputs
+│   ├── pointclouds_depth_pro_legacy/              # Legacy Depth Pro outputs
+│   ├── pointclouds_da3/                           # DA3 outputs
+│   └── pointclouds_marigold/                      # Marigold-DC outputs
 ├── analyze_depth.py              # One-off: verify GT depth unit conversion
 │
-├── change_detection_results/     # Scripts + outputs for change detection experiments (incl. mask_tests.ipynb)
+├── change_detection_results/     # Scripts + outputs for change detection (masking) experiments
 ├── compare_edit_depth/           # Scripts + outputs for depth calibration evaluation
 │
 ├── data/                         # Input datasets (UE renders + edited images)
-├── pointclouds/                  # Output .las files from Depth Pro pipeline
-├── pointclouds2/                 # Output .las files from DA3 pipeline
 │
 ├── Depth-Anything-3/             # Vendored: DA3 model repo (third-party)
 ├── Robust-Scene-Change-Detection/ # Vendored: cross-attention change detection (third-party)
@@ -88,20 +94,21 @@ Sky pixels are detected via a "density knee" on the GT depth histogram — the p
 ### Depth Models
 | Model | Notebook | Script flag |
 |---|---|---|
-| Depth Pro | `img_to_pointcloud.ipynb` | `--model dpro` |
-| Depth Anything 3 Giant | `img_to_pointcloud2.ipynb` | `--model da3_giant` |
-| Depth Anything 3 Nested | `img_to_pointcloud2.ipynb` | `--model da3_nested` |
+| Depth Pro | `MAIN_TEST/img_to_pointcloud_depth_pro.ipynb` | `--model dpro` |
+| Depth Anything 3 Giant | `MAIN_TEST/img_to_pointcloud_da3.ipynb` | `--model da3_giant` |
+| Depth Anything 3 Nested | `MAIN_TEST/img_to_pointcloud_da3.ipynb` | `--model da3_nested` |
 
 ### Tested Depth Models
 These are the monocular depth models that have been tested in this repo so far.
 
 | Model | Status | Where it appears |
 |---|---|---|
-| Depth Pro | Current | Point-cloud notebook, `compare_edit_depth.py`, `compare_edit_depth2.py` |
+| Depth Pro | Current | `MAIN_TEST/img_to_pointcloud_depth_pro.ipynb`, `compare_edit_depth.py`, `compare_edit_depth2.py` |
 | Depth Anything V2 Metric | Tested in evaluation | Early analysis notes, `compare_edit_depth.py`, `compare_edit_depth2.py` |
-| Depth Anything 3 Giant 1.1 | Current | `img_to_pointcloud2.ipynb`, `compare_edit_depth2.py` |
-| Depth Anything 3 Nested Giant 1.1 | Current | `img_to_pointcloud2.ipynb`, `compare_edit_depth2.py` |
-| Metric3D v2 | Legacy evaluation only | `compare_edit_depth.py` and saved `compare_edit_depth/*_results/` metrics |
+| Depth Anything 3 Giant 1.1 | Current | `MAIN_TEST/img_to_pointcloud_da3.ipynb`, `compare_edit_depth2.py` |
+| Depth Anything 3 Nested Giant 1.1 | Current | `MAIN_TEST/img_to_pointcloud_da3.ipynb`, `compare_edit_depth2.py` |
+| Marigold-DC | Evaluation baseline | `compare_edit_depth2.py`; uses sparse UE GT depth on unchanged pixels |
+| Metric3D v2 | Legacy evaluation only | `compare_edit_depth.py` and saved `compare_edit_depth/v1/*_results/` metrics |
 
 Metric3D v2 was tested in the older v1 comparison pipeline, but it is not part of the current recommended v2 workflow or the point-cloud notebooks.
 
@@ -124,8 +131,15 @@ python change_detection_results/test_change_detection.py --dataset depth4
 # 2. Evaluate depth calibration (v2 — recommended)
 python compare_edit_depth/compare_edit_depth2.py --model dpro --dataset depth4 --mask-model gescf
 
+# Optional: evaluate sparse-guided depth completion
+python compare_edit_depth/compare_edit_depth2.py --model marigold_dc --dataset depth4 --mask-model gescf
+
 # 3. Generate a point cloud (open notebook, set DATASET at top, run all cells)
-#    img_to_pointcloud.ipynb  or  img_to_pointcloud2.ipynb
+#    MAIN_TEST/img_to_pointcloud_depth_pro.ipynb
+#    MAIN_TEST/img_to_pointcloud_da3.ipynb
+
+# 4. Generate a point cloud with Marigold-DC (open notebook, run all cells)
+#    MAIN_TEST/img_to_pointcloud_marigold.ipynb
 ```
 
 Notebook settings to configure at the top of each notebook:
@@ -147,17 +161,12 @@ Best configuration: **Depth Pro + GeSCF mask + least-squares calibration**
 
 ## Dependencies
 
-No pinned environment file yet. Requires:
+GPU is required for practical use of this repo. The models may fall back to CPU in some places, but the full pipeline is too slow to be usable without a GPU.
 
-```
-Python 3.10+, PyTorch
-OpenEXR, Imath
-Pillow, numpy, scipy, opencv-python, matplotlib
-laspy
-depth_pro
-segment-anything
-transformers
+Install the public Python packages with:
+
+```bash
+pip install -r requirements.txt
 ```
 
-DA3 weights download automatically from Hugging Face on first run.
-Depth Pro weights (`checkpoints/depth_pro.pt`) and SAM weights (`weights/sam_vit_b_01ec64.pth`) must be downloaded manually — see the respective repos for links.
+Setup steps that are not covered by `requirements.txt` are documented in `setup.md`.
