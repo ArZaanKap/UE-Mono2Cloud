@@ -12,21 +12,31 @@ def load_model_streaming(
     filename: str | PathLike[str],
     *,
     strict: bool = True,
-    log_every: int = 250,
+    log_every: int = 50,
 ) -> Tuple[List[str], List[str]]:
-    """Load a safetensors checkpoint into an existing module without building a full state_dict copy.
+    """Load a safetensors checkpoint into an existing on-device module.
 
-    This keeps peak host RAM much lower than `safetensors.torch.load_model`, which first
-    materializes the entire checkpoint as a Python dict of tensors before calling
-    `model.load_state_dict(...)`.
+    Loads tensors directly to the model's device (e.g. CUDA) via safetensors,
+    then copies into the model parameters in-place.  This avoids allocating
+    large CPU tensors, which can OOM the system RAM on Windows.
     """
+
+    # Detect the device the model lives on (all params should share one device).
+    model_device = "cpu"
+    for p in model.parameters():
+        model_device = str(p.device)
+        break
 
     state = model.state_dict(keep_vars=True)
     expected_keys = set(state.keys())
-    loaded_keys = set()
+    loaded_keys: set[str] = set()
     unexpected: List[str] = []
 
-    with safe_open(str(filename), framework="pt", device="cpu") as handle:
+    # device=model_device → get_tensor returns tensors already on CUDA (or
+    # wherever the model lives).  Safetensors does this via a direct DMA read
+    # from the memory-mapped file into a device buffer, so peak *host* RAM
+    # stays near zero.
+    with safe_open(str(filename), framework="pt", device=model_device) as handle:
         file_keys = list(handle.keys())
         total = len(file_keys)
 
@@ -36,16 +46,13 @@ def load_model_streaming(
                 continue
 
             dst = state[name]
-            src = handle.get_tensor(name)
+            src = handle.get_tensor(name)  # already on model_device
 
             if src.shape != dst.shape:
                 raise RuntimeError(
                     f"Shape mismatch for {name}: checkpoint has {tuple(src.shape)}, "
                     f"model expects {tuple(dst.shape)}"
                 )
-
-            if src.dtype != dst.dtype or src.device != dst.device:
-                src = src.to(device=dst.device, dtype=dst.dtype)
 
             with torch.no_grad():
                 dst.copy_(src)
