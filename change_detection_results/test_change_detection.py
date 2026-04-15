@@ -1,20 +1,19 @@
 """
 Change Detection Model Comparison
-=================================
-Tests different approaches for detecting changes between original and edited images:
-1. RGB Threshold - Simple pixel difference baseline
-2. DINOv2 - Semantic feature-based difference (518px, multi-layer, registers)
-3. GeSCF-style - SAM Q/K/V attention features + adaptive thresholding (CVPR 2025-inspired)
-4. DINOv2+CrossAttn - Pretrained scene change detection (ICRA 2025)
+==================================
+Runs RGB / DINOv2 / GeSCF / CrossAttn change detection on a dataset image pair
+and writes binary masks (.npy) and visualisations (.png) to
+    change_detection_results/{dataset}/
 
-Each method produces its own {method}_{dataset}.png with 2x2 layout, plus a
-summary_{dataset}.png comparing all masks side by side.
+Default parameters are read from params.py — edit that file to keep the sweep
+notebooks and this script in sync.
+
+Usage:
+    python change_detection_results/test_change_detection.py --dataset depth4
+    python change_detection_results/test_change_detection.py --dataset depth4 --skip-dino --skip-crossattn
 """
 
-import os
-import sys
-import glob
-import argparse
+import os, sys, glob, argparse, json
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
@@ -22,335 +21,287 @@ import torch
 import torch.nn.functional as F
 from scipy import ndimage
 
-# Configuration
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # Parent directory (UE_depth)
-DEFAULT_DATASET = "depth4"
+SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+sys.path.insert(0, SCRIPT_DIR)
 
+from params import DINO_BASELINE, GESCF_BASELINE, RGB_BASELINE, CROSSATTN_BASELINE
+
+DEFAULT_DATASET          = "new0"
+DEFAULT_CHANGE_THRESHOLD = 0.05   # metres — for GT mask derivation from depth diff
+
+AVAILABLE_DATASETS = ['depth4', 'concrete1', 'test2', 'new0', 'new1']
+
+
+# ---------------------------------------------------------------------------
+# Image / depth loading
+# ---------------------------------------------------------------------------
+
+def load_exr_depth(exr_path, gt_to_cm=10000.0):
+    """Load depth from EXR file, convert to metres."""
+    import OpenEXR, Imath
+    exr_file = OpenEXR.InputFile(exr_path)
+    header   = exr_file.header()
+    dw       = header['dataWindow']
+    width    = dw.max.x - dw.min.x + 1
+    height   = dw.max.y - dw.min.y + 1
+    FLOAT    = Imath.PixelType(Imath.PixelType.FLOAT)
+    channels = list(header['channels'].keys())
+    for chan_name in ['R', 'SceneDepth', 'Z']:
+        if chan_name in channels:
+            channel_str = exr_file.channel(chan_name, FLOAT)
+            depth = np.frombuffer(channel_str, dtype=np.float32).reshape(height, width).copy()
+            break
+    else:
+        raise ValueError(f"No depth channel found in {exr_path}")
+    return (depth * gt_to_cm) / 100.0
+
+
+# ---------------------------------------------------------------------------
+# Image loading
+# ---------------------------------------------------------------------------
 
 def load_exr_rgb(exr_path):
-    """Load RGB channels from EXR file."""
-    import OpenEXR
-    import Imath
-    exr_file = OpenEXR.InputFile(exr_path)
-    header = exr_file.header()
-    dw = header['dataWindow']
-    width = dw.max.x - dw.min.x + 1
-    height = dw.max.y - dw.min.y + 1
-
-    FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
-    rgb = []
-    for c in ['R', 'G', 'B']:
-        channel_str = exr_file.channel(c, FLOAT)
-        channel = np.frombuffer(channel_str, dtype=np.float32).reshape(height, width)
-        rgb.append(channel)
-
-    img = np.stack(rgb, axis=-1)
-    img = np.clip(img, 0, 1)
-    img = (img * 255).astype(np.uint8)
-    return Image.fromarray(img)
+    import OpenEXR, Imath
+    exr = OpenEXR.InputFile(exr_path)
+    dw  = exr.header()['dataWindow']
+    w   = dw.max.x - dw.min.x + 1
+    h   = dw.max.y - dw.min.y + 1
+    FLT = Imath.PixelType(Imath.PixelType.FLOAT)
+    rgb = np.stack(
+        [np.frombuffer(exr.channel(c, FLT), dtype=np.float32).reshape(h, w) for c in 'RGB'],
+        axis=-1,
+    )
+    return Image.fromarray(np.clip(rgb * 255, 0, 255).astype(np.uint8))
 
 
 def load_image(path):
-    """Load image from EXR or standard format."""
     if path.lower().endswith('.exr'):
         return load_exr_rgb(path)
-    else:
-        return Image.open(path).convert('RGB')
+    return Image.open(path).convert('RGB')
 
 
 def find_image_pair(folder):
-    """Find original and edited images in folder."""
-    files = os.listdir(folder)
+    """Return (original_path, edited_path).
 
-    # Find original RGB: EXR without 'depth' or 'scenedepth' in name
-    original = None
-    for f in files:
-        if f.endswith('.exr') and 'depth' not in f.lower() and 'scenedepth' not in f.lower():
-            original = os.path.join(folder, f)
-            break
+    Handles two naming conventions:
+    - UE 00000/00001: two SceneDepth EXRs present → sorted PNGs (first=orig, second=edit)
+    - Legacy: EXR original + PNG with 'edit' in filename
+    """
+    files = sorted(os.listdir(folder))
 
-    # Find edited image: look for 'edit' in name
-    edited = None
-    for f in files:
-        if 'edit' in f.lower() and (f.endswith('.png') or f.endswith('.jpg') or f.endswith('.exr')):
-            edited = os.path.join(folder, f)
-            break
+    scene_depth_exrs = sorted([
+        f for f in files
+        if 'SceneDepth' in f and 'WorldUnits' not in f and f.lower().endswith('.exr')
+    ])
+    rgb_pngs = sorted([
+        f for f in files
+        if f.lower().endswith('.png') and 'depth' not in f.lower()
+    ])
 
+    # UE GT mode: two SceneDepth EXRs → sorted PNGs are original + edited
+    if len(scene_depth_exrs) >= 2 and len(rgb_pngs) >= 2:
+        return (
+            os.path.join(folder, rgb_pngs[0]),
+            os.path.join(folder, rgb_pngs[1]),
+        )
+
+    original = next(
+        (os.path.join(folder, f) for f in files
+         if f.lower().endswith('.exr')
+         and 'depth' not in f.lower()
+         and 'scenedepth' not in f.lower()
+         and 'normal' not in f.lower()),
+        None,
+    )
+    edited = next(
+        (os.path.join(folder, f) for f in files
+         if 'edit' in f.lower() and f.lower().endswith(('.png', '.jpg', '.exr'))),
+        None,
+    )
     return original, edited
+
+
+def find_depth_pair(folder):
+    """Return (depth_gt_orig, depth_gt_edit) — edit depth may be None."""
+    files = sorted(os.listdir(folder))
+    scene_depth_exrs = sorted([
+        f for f in files
+        if 'SceneDepth' in f and 'WorldUnits' not in f and f.lower().endswith('.exr')
+    ])
+    if len(scene_depth_exrs) >= 2:
+        return (
+            os.path.join(folder, scene_depth_exrs[0]),
+            os.path.join(folder, scene_depth_exrs[1]),
+        )
+    if len(scene_depth_exrs) == 1:
+        return os.path.join(folder, scene_depth_exrs[0]), None
+    return None, None
 
 
 # ---------------------------------------------------------------------------
 # Change detection methods
 # ---------------------------------------------------------------------------
 
-def rgb_threshold_mask(img1, img2, threshold=10):
-    """
-    Simple RGB threshold-based change detection.
-    Returns mask where True = changed pixel.
-    """
+def rgb_threshold_mask(img1, img2,
+                        threshold=RGB_BASELINE['threshold'],
+                        min_area=RGB_BASELINE['min_area'],
+                        dilate_iter=RGB_BASELINE['dilate_iter']):
     arr1 = np.array(img1).astype(float)
     arr2 = np.array(img2).astype(float)
-
-    # Mean absolute difference across RGB channels
     diff = np.abs(arr1 - arr2).mean(axis=2)
-    changed_mask = diff > threshold
+    mask = diff > threshold
+    mask = _refine(mask, min_area=min_area, dilate_iter=dilate_iter)
+    return mask, diff
 
-    return changed_mask, diff
 
-
-def dinov2_feature_mask(img1, img2, threshold=0.3, model_name="facebook/dinov2-with-registers-base"):
-    """
-    DINOv2 feature-based change detection.
-    Uses 518x518 input (37x37 patches), multi-layer feature concatenation
-    from layers {3,6,9,12}, and Gaussian smoothing for clean spatial maps.
-    Returns mask where True = changed region.
-    """
+def dinov2_feature_mask(img1, img2,
+                         threshold=DINO_BASELINE['threshold'],
+                         sigma=DINO_BASELINE['sigma'],
+                         min_area=DINO_BASELINE['min_area'],
+                         dilate_iter=DINO_BASELINE['dilate_iter'],
+                         model_name="facebook/dinov2-with-registers-base"):
     from transformers import AutoImageProcessor, AutoModel
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Loading DINOv2 model ({model_name})...")
-
-    # 518x518 gives 37x37 patches (5x more spatial detail than 224x224)
-    processor = AutoImageProcessor.from_pretrained(model_name, size={"height": 518, "width": 518}, crop_size={"height": 518, "width": 518})
-    model = AutoModel.from_pretrained(model_name).to(device)
-    model.eval()
-
-    # Number of register tokens to skip (reg4 models have 4)
+    print(f"  Loading DINOv2 ({model_name}) on {device} ...")
+    processor = AutoImageProcessor.from_pretrained(
+        model_name,
+        size={"height": 518, "width": 518},
+        crop_size={"height": 518, "width": 518},
+    )
+    model = AutoModel.from_pretrained(model_name).to(device).eval()
     num_register = 4 if "reg" in model_name else 0
 
-    # Process images
     with torch.no_grad():
-        inputs1 = processor(images=img1, return_tensors="pt").to(device)
-        inputs2 = processor(images=img2, return_tensors="pt").to(device)
-
-        # Get multi-layer features (layers 3, 6, 9, 12 for ViT-B)
-        outputs1 = model(**inputs1, output_hidden_states=True)
-        outputs2 = model(**inputs2, output_hidden_states=True)
-
-        # Skip CLS token (idx 0) and register tokens (idx 1..num_register)
+        inp1 = processor(images=img1, return_tensors="pt").to(device)
+        inp2 = processor(images=img2, return_tensors="pt").to(device)
+        out1 = model(**inp1, output_hidden_states=True)
+        out2 = model(**inp2, output_hidden_states=True)
         skip = 1 + num_register
-        selected1 = [outputs1.hidden_states[i][:, skip:, :] for i in [3, 6, 9, 12]]
-        selected2 = [outputs2.hidden_states[i][:, skip:, :] for i in [3, 6, 9, 12]]
-        features1 = torch.cat(selected1, dim=-1)  # [1, num_patches, 4*hidden_dim]
-        features2 = torch.cat(selected2, dim=-1)
+        f1 = torch.cat([out1.hidden_states[i][:, skip:, :] for i in [3, 6, 9, 12]], dim=-1)
+        f2 = torch.cat([out2.hidden_states[i][:, skip:, :] for i in [3, 6, 9, 12]], dim=-1)
+        distance = (1 - (F.normalize(f1, dim=-1) * F.normalize(f2, dim=-1)).sum(dim=-1)).squeeze()
 
-        # Compute cosine similarity per patch
-        features1_norm = features1 / features1.norm(dim=-1, keepdim=True)
-        features2_norm = features2 / features2.norm(dim=-1, keepdim=True)
-        similarity = (features1_norm * features2_norm).sum(dim=-1)  # [1, num_patches]
-
-        # Convert to distance (1 - similarity)
-        distance = 1 - similarity.squeeze()  # [num_patches] (keep as tensor)
-
-    # Reshape to 2D patch grid (37x37 for 518x518 input)
-    num_patches = distance.shape[0]
-    grid_size = int(np.sqrt(num_patches))
-    distance_map = distance.reshape(1, 1, grid_size, grid_size)
-
-    # Upsample to original image size using F.interpolate
     h, w = np.array(img1).shape[:2]
-    distance_map_full = F.interpolate(distance_map, size=(h, w), mode='bilinear', align_corners=False)
-    distance_map_full = distance_map_full.squeeze().cpu().numpy()
+    grid = int(np.sqrt(distance.shape[0]))
+    dist_map = F.interpolate(
+        distance.reshape(1, 1, grid, grid), size=(h, w), mode='bilinear', align_corners=False,
+    ).squeeze().cpu().numpy()
+    dist_map = ndimage.gaussian_filter(dist_map, sigma=sigma)
 
-    # Gaussian smoothing to remove blocky patch artifacts (sigma=4, per AnomalyDINO)
-    distance_map_full = ndimage.gaussian_filter(distance_map_full, sigma=4)
-
-    # Threshold to get binary mask
-    changed_mask = distance_map_full > threshold
-
-    return changed_mask, distance_map_full
+    mask = _refine(dist_map > threshold, min_area=min_area, dilate_iter=dilate_iter)
+    return mask, dist_map
 
 
-def gescf_feature_mask(img1, img2, threshold=None):
-    """
-    GeSCF-style change detection (CVPR 2025-inspired).
-
-    Uses SAM ViT encoder's internal Q/K/V attention features (not just the
-    final embedding) to compute cross-image cosine similarity, then applies
-    adaptive skewness-based thresholding from the GeSCF paper.
-
-    Requires: pip install segment-anything
-    Weights: sam_vit_b_01ec64.pth (auto-downloaded if missing)
-
-    Key differences from naive SAM feature comparison:
-      - Uses Q/K/V from intermediate attention layers (richer than final output)
-      - Adaptive threshold based on distance-map skewness (not a fixed value)
-      - SAM automatic mask generator filters the result into clean segments
-    """
+def gescf_feature_mask(img1, img2,
+                        threshold=None,
+                        points_per_side=GESCF_BASELINE['points_per_side'],
+                        pred_iou_thresh=GESCF_BASELINE['pred_iou_thresh'],
+                        stability_score_thresh=GESCF_BASELINE['stability_score_thresh'],
+                        min_mask_region_area=GESCF_BASELINE['min_mask_region_area'],
+                        overlap_frac=GESCF_BASELINE['overlap_frac']):
     try:
         from segment_anything import sam_model_registry, SamAutomaticMaskGenerator
     except ImportError:
-        raise ImportError(
-            "segment-anything not installed. Run: pip install segment-anything"
-        )
+        raise ImportError("segment-anything not installed. Run: pip install segment-anything")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # --- locate / download weights ---
-    weights_dir = os.path.join(PROJECT_ROOT, "weights")
+    weights_dir  = os.path.join(PROJECT_ROOT, "weights")
     os.makedirs(weights_dir, exist_ok=True)
     weights_path = os.path.join(weights_dir, "sam_vit_b_01ec64.pth")
-
     if not os.path.exists(weights_path):
         print("  Downloading SAM ViT-B weights (~375 MB) ...")
         import urllib.request
-        url = "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth"
-        urllib.request.urlretrieve(url, weights_path)
-        print("  Download complete.")
+        urllib.request.urlretrieve(
+            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth",
+            weights_path,
+        )
 
-    print(f"  Loading SAM ViT-B (segment-anything) on {device} ...")
-    sam = sam_model_registry["vit_b"](checkpoint=weights_path)
-    sam.to(device)
-    sam.eval()
+    print(f"  Loading SAM ViT-B on {device} ...")
+    sam = sam_model_registry["vit_b"](checkpoint=weights_path).to(device).eval()
 
     h, w = np.array(img1).shape[:2]
 
-    # --- hook to capture Q/K/V from an intermediate encoder block ---
-    # SAM ViT-B uses global attention at indices [2, 5, 8, 11]; other blocks
-    # use windowed attention (which partitions tokens and breaks our reshape).
-    # We use block 8: a global-attention block near the end of the encoder.
     captured = {}
+    hook = sam.image_encoder.blocks[8].attn.qkv.register_forward_hook(
+        lambda m, i, o: captured.__setitem__("qkv", o.detach())
+    )
 
-    def _hook_qkv(module, input, output):
-        """Capture the linear projection output before reshape into Q/K/V."""
-        captured["qkv"] = output.detach()
-
-    target_block = sam.image_encoder.blocks[8]
-    hook_handle = target_block.attn.qkv.register_forward_hook(_hook_qkv)
-
-    # --- preprocess both images ---
     from segment_anything.utils.transforms import ResizeLongestSide
-    img_size = sam.image_encoder.img_size
+    img_size  = sam.image_encoder.img_size
     transform = ResizeLongestSide(img_size)
-    patch_size = 16  # SAM ViT patch size
+    scale     = img_size / max(h, w)
+    feat_h    = int(h * scale + 0.5) // 16
+    feat_w    = int(w * scale + 0.5) // 16
 
-    def _prepare(pil_img):
-        img_np = np.array(pil_img)
-        img_t = transform.apply_image(img_np)
-        img_t = torch.as_tensor(img_t, device=device).permute(2, 0, 1).unsqueeze(0).float()
-        img_t = sam.preprocess(img_t)
-        return img_t
+    def _prep(pil_img):
+        t = transform.apply_image(np.array(pil_img))
+        return sam.preprocess(torch.as_tensor(t, device=device).permute(2, 0, 1).unsqueeze(0).float())
 
-    # Compute the resized (pre-padding) dimensions so we can crop the feature map
-    scale = img_size / max(h, w)
-    resized_h = int(h * scale + 0.5)
-    resized_w = int(w * scale + 0.5)
-    feat_h = resized_h // patch_size  # rows of real content in 64x64 feature map
-    feat_w = resized_w // patch_size
-    print(f"  Image {w}x{h} -> SAM {resized_w}x{resized_h} -> feat {feat_w}x{feat_h} (of {img_size // patch_size}x{img_size // patch_size})")
-
-    img1_t = _prepare(img1)
-    img2_t = _prepare(img2)
-
-    # --- forward pass to capture Q/K/V features ---
     with torch.no_grad():
-        sam.image_encoder(img1_t)
-        qkv1 = captured["qkv"]  # [B, H_feat, W_feat, D] (spatial dims kept)
+        sam.image_encoder(_prep(img1)); qkv1 = captured["qkv"]
+        sam.image_encoder(_prep(img2)); qkv2 = captured["qkv"]
+    hook.remove()
 
-        sam.image_encoder(img2_t)
-        qkv2 = captured["qkv"]
-
-    hook_handle.remove()
-
-    # --- compute per-token cosine distance ---
     with torch.no_grad():
-        f1 = qkv1.squeeze(0)  # [H_feat_full, W_feat_full, D]
-        f2 = qkv2.squeeze(0)
+        f1, f2 = qkv1.squeeze(0), qkv2.squeeze(0)
+        dist_map = (1 - (F.normalize(f1, dim=-1) * F.normalize(f2, dim=-1)).sum(dim=-1)).cpu().numpy()
 
-        f1_norm = f1 / (f1.norm(dim=-1, keepdim=True) + 1e-8)
-        f2_norm = f2 / (f2.norm(dim=-1, keepdim=True) + 1e-8)
-        cosine_sim = (f1_norm * f2_norm).sum(dim=-1)  # [H_feat_full, W_feat_full]
-        dist_map_full_feat = (1 - cosine_sim).cpu().numpy()
+    dist_map = dist_map[:feat_h, :feat_w]
+    dist_map = F.interpolate(
+        torch.tensor(dist_map).float().unsqueeze(0).unsqueeze(0),
+        size=(h, w), mode='bilinear', align_corners=False,
+    ).squeeze().numpy()
+    dist_map = ndimage.gaussian_filter(dist_map, sigma=4)
+    d_min, d_max = dist_map.min(), dist_map.max()
+    if d_max - d_min > 1e-8:
+        dist_map = (dist_map - d_min) / (d_max - d_min)
 
-    # Crop to actual content region (remove zero-padding area)
-    dist_map = dist_map_full_feat[:feat_h, :feat_w]
-
-    # Upsample cropped feature map to original image size
-    dist_map_tensor = torch.tensor(dist_map, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-    dist_map_full = F.interpolate(dist_map_tensor, size=(h, w), mode='bilinear', align_corners=False)
-    dist_map_full = dist_map_full.squeeze().numpy()
-
-    # Gaussian smoothing
-    dist_map_full = ndimage.gaussian_filter(dist_map_full, sigma=4)
-
-    # Normalise to [0, 1]
-    dmin, dmax = dist_map_full.min(), dist_map_full.max()
-    if dmax - dmin > 1e-8:
-        dist_map_full = (dist_map_full - dmin) / (dmax - dmin)
-
-    # --- adaptive threshold (skewness-based, from GeSCF) ---
     if threshold is None:
         from scipy.stats import skew
-        sk = skew(dist_map_full.ravel())
-        # GeSCF: if distribution is right-skewed (most pixels similar, few changed),
-        # use mean + k*std where k scales with skewness
-        mu = dist_map_full.mean()
-        sigma = dist_map_full.std()
-        k = min(max(sk, 1.0), 3.0)  # clamp skewness factor
-        threshold = mu + k * sigma
+        sk        = skew(dist_map.ravel())
+        k         = float(np.clip(sk, 1.0, 3.0))
+        threshold = float(dist_map.mean() + k * dist_map.std())
         print(f"  Adaptive threshold: {threshold:.4f}  (skew={sk:.2f}, k={k:.2f})")
     else:
         print(f"  Fixed threshold: {threshold:.4f}")
 
-    initial_mask = dist_map_full > threshold
+    initial_mask = dist_map > threshold
 
-    # --- SAM automatic mask generator for segment-level refinement ---
-    print("  Running SAM automatic mask generator for refinement ...")
+    print(f"  Running SAM (points_per_side={points_per_side}) ...")
     mask_gen = SamAutomaticMaskGenerator(
         sam,
-        points_per_side=16,      # coarser grid for speed on CPU
-        pred_iou_thresh=0.80,
-        stability_score_thresh=0.85,
-        min_mask_region_area=200,
+        points_per_side=points_per_side,
+        pred_iou_thresh=pred_iou_thresh,
+        stability_score_thresh=stability_score_thresh,
+        min_mask_region_area=min_mask_region_area,
     )
-    img2_np = np.array(img2)
-    sam_masks = mask_gen.generate(img2_np)
-    print(f"  SAM generated {len(sam_masks)} candidate masks")
+    sam_masks = mask_gen.generate(np.array(img2))
+    print(f"  SAM generated {len(sam_masks)} segments")
 
-    # Keep SAM segments that overlap significantly with the initial change mask
     refined_mask = np.zeros((h, w), dtype=bool)
     for seg in sam_masks:
-        seg_mask = seg["segmentation"]
-        overlap = np.logical_and(seg_mask, initial_mask).sum()
-        seg_area = seg_mask.sum()
-        if seg_area > 0 and overlap / seg_area > 0.3:
-            refined_mask |= seg_mask
+        m = seg["segmentation"]
+        if m.sum() > 0 and np.logical_and(m, initial_mask).sum() / m.sum() > overlap_frac:
+            refined_mask |= m
 
-    # Fall back to initial mask if SAM refinement removed everything
     if refined_mask.sum() == 0:
-        print("  SAM refinement produced empty mask, using initial threshold mask")
+        print("  SAM refinement empty — falling back to initial threshold mask")
         refined_mask = initial_mask
 
-    return refined_mask, dist_map_full
+    return refined_mask, dist_map
 
 
-def dino_crossattn_mask(img1, img2, threshold=0.3, pretrained="dino_2Cross_CMU"):
-    """
-    DINOv2 + CrossAttention pretrained scene change detection (ICRA 2025).
-
-    Uses the Robust-Scene-Change-Detection repo which provides a DINOv2-small
-    backbone with cross-attention heads, pretrained for binary scene change
-    detection.
-
-    Available pretrained models:
-      - dino_2Cross_CMU    (outdoor, CMU Seasons)
-      - dino_2Cross_PSCD   (indoor/outdoor, PSCD dataset)
-      - dino_2Cross_DiffCMU
-
-    Args:
-        threshold: Probability threshold for "changed" class (default 0.3).
-                   Lower = more sensitive. The model's default argmax uses 0.5.
-
-    Returns binary mask (True = changed) and a soft probability map.
-    """
+def dino_crossattn_mask(img1, img2, threshold=0.5, pretrained="dino_2Cross_PSCD"):
+    """DINOv2 + CrossAttention pretrained scene change detection (ICRA 2025)."""
     try:
         from robust_scene_change_detect.models import get_model_from_pretrained
     except ImportError as e:
         raise ImportError(
             "robust-scene-change-detection not installed.\n"
-            "Install it:\n"
-            f"  cd {PROJECT_ROOT}\n"
+            "  cd {root}\n"
             "  git clone https://github.com/ChadLin9596/Robust-Scene-Change-Detection\n"
             "  cd Robust-Scene-Change-Detection\n"
             "  git submodule update --init --recursive\n"
@@ -360,31 +311,24 @@ def dino_crossattn_mask(img1, img2, threshold=0.3, pretrained="dino_2Cross_CMU")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"  Loading DINOv2+CrossAttn ({pretrained}) on {device} ...")
     model = get_model_from_pretrained(pretrained)
-    # Unwrap DataParallel for CPU compatibility
     if hasattr(model, 'module'):
         model = model.module
-    model = model.to(device)
-    model.eval()
+    model = model.to(device).eval()
 
     h, w = np.array(img1).shape[:2]
 
-    # Preprocess: resize to 504x504 (must be 14*n for ViT patch size)
-    target_size = 504
     from torchvision import transforms
     preprocess = transforms.Compose([
-        transforms.Resize((target_size, target_size)),
+        transforms.Resize((504, 504)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-
-    t0 = preprocess(img1).unsqueeze(0).to(device)  # [1, 3, 504, 504]
+    t0 = preprocess(img1).unsqueeze(0).to(device)
     t1 = preprocess(img2).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        pred = model(t0, t1)  # logits [1, H', W', 2]
+        pred = model(t0, t1)
 
-    # The model outputs per-pixel class logits [B, H', W', 2]
     if pred.dim() == 4 and pred.shape[-1] == 2:
         prob_map = torch.softmax(pred, dim=-1)[0, :, :, 1].cpu().numpy()
     elif pred.dim() == 4 and pred.shape[1] == 2:
@@ -392,297 +336,131 @@ def dino_crossattn_mask(img1, img2, threshold=0.3, pretrained="dino_2Cross_CMU")
     else:
         prob_map = torch.sigmoid(pred).squeeze().cpu().numpy()
 
-    # Apply threshold on probability (not argmax which forces 0.5)
-    pred_mask = prob_map > threshold
-    print(f"  Threshold: {threshold}  (prob range: {prob_map.min():.3f} - {prob_map.max():.3f})")
+    print(f"  Threshold: {threshold}  (prob range: {prob_map.min():.3f}–{prob_map.max():.3f})")
 
-    # Resize mask and probability map back to original image dimensions
-    pred_mask_pil = Image.fromarray(pred_mask.astype(np.uint8) * 255)
-    pred_mask_full = np.array(pred_mask_pil.resize((w, h), Image.NEAREST)) > 127
+    pred_mask = Image.fromarray((prob_map > threshold).astype(np.uint8) * 255)
+    mask_full = np.array(pred_mask.resize((w, h), Image.NEAREST)) > 127
+    prob_full = np.array(
+        Image.fromarray((prob_map * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
+    ).astype(np.float32) / 255.0
 
-    prob_pil = Image.fromarray((prob_map * 255).astype(np.uint8))
-    prob_map_full = np.array(prob_pil.resize((w, h), Image.BILINEAR)).astype(np.float32) / 255.0
-
-    return pred_mask_full, prob_map_full
+    return mask_full, prob_full
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
-def refine_mask(mask, min_area=500, dilate_iter=2):
-    """
-    Refine binary mask by removing small regions and smoothing.
-    """
+def _score_mask(pred_mask, gt_changed):
+    """Compute precision, recall, F1, IoU of pred_mask vs ground-truth changed mask."""
+    tp = int(np.logical_and(pred_mask,  gt_changed).sum())
+    fp = int(np.logical_and(pred_mask,  ~gt_changed).sum())
+    fn = int(np.logical_and(~pred_mask, gt_changed).sum())
+    tn = int(np.logical_and(~pred_mask, ~gt_changed).sum())
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1        = (2 * precision * recall / (precision + recall)
+                 if (precision + recall) > 0 else 0.0)
+    iou       = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
+    return dict(precision=precision, recall=recall, f1=f1, iou=iou,
+                tp=tp, fp=fp, fn=fn, tn=tn)
+
+
+def _refine(mask, min_area=500, dilate_iter=2):
     mask = mask.copy()
-    # Remove small connected components
-    labeled, num_features = ndimage.label(mask)
-    for i in range(1, num_features + 1):
+    labeled, n = ndimage.label(mask)
+    for i in range(1, n + 1):
         if np.sum(labeled == i) < min_area:
             mask[labeled == i] = False
-
-    # Dilate to fill gaps
-    mask = ndimage.binary_dilation(mask, iterations=dilate_iter)
-
-    # Fill holes
-    mask = ndimage.binary_fill_holes(mask)
-
-    return mask
+    if dilate_iter > 0:
+        mask = ndimage.binary_dilation(mask, iterations=dilate_iter)
+    return ndimage.binary_fill_holes(mask)
 
 
-def compute_mask_metrics(mask1, mask2):
-    """Compute IoU and other metrics between two binary masks."""
-    intersection = np.logical_and(mask1, mask2).sum()
-    union = np.logical_or(mask1, mask2).sum()
-    iou = intersection / union if union > 0 else 0
-
-    # Dice coefficient
-    dice = 2 * intersection / (mask1.sum() + mask2.sum()) if (mask1.sum() + mask2.sum()) > 0 else 0
-
-    return {'iou': iou, 'dice': dice, 'pixels_mask1': mask1.sum(), 'pixels_mask2': mask2.sum()}
-
-
-def clean_old_outputs(output_folder, dataset):
-    """Remove old per-method and summary PNGs from previous runs."""
-    patterns = [
-        os.path.join(output_folder, f"*_{dataset}.png"),
-        os.path.join(output_folder, f"change_detection_{dataset}.png"),
-        os.path.join(output_folder, f"sweep_{dataset}.png"),
-    ]
-    removed = []
-    for pat in patterns:
-        for f in glob.glob(pat):
-            os.remove(f)
-            removed.append(os.path.basename(f))
-    if removed:
-        print(f"Cleaned old outputs: {', '.join(removed)}")
-
-
-def save_method_png(original_img, edited_img, diff_map, mask, method_label,
-                    output_folder, dataset, vmax=None):
-    """
-    Save a 2x2 per-method visualization PNG.
-      Top-left:     Original image
-      Top-right:    Edited image
-      Bottom-left:  Difference / distance heatmap
-      Bottom-right: Binary mask overlaid on edited image
-    """
+def _save_method_png(original_img, edited_img, diff_map, mask, label, out_dir, dataset, vmax=None):
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
-    axes[0, 0].imshow(original_img)
-    axes[0, 0].set_title("Original")
-    axes[0, 0].axis("off")
-
-    axes[0, 1].imshow(edited_img)
-    axes[0, 1].set_title("Edited")
-    axes[0, 1].axis("off")
+    axes[0, 0].imshow(original_img); axes[0, 0].set_title("Original"); axes[0, 0].axis("off")
+    axes[0, 1].imshow(edited_img);   axes[0, 1].set_title("Edited");   axes[0, 1].axis("off")
 
     im = axes[1, 0].imshow(diff_map, cmap="hot", vmin=0, vmax=vmax)
-    axes[1, 0].set_title(f"{method_label} Difference Map")
-    axes[1, 0].axis("off")
+    axes[1, 0].set_title(f"{label} difference map"); axes[1, 0].axis("off")
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
 
-    # Overlay mask on edited image
-    overlay = np.array(edited_img).copy()
-    overlay_rgba = np.zeros((*mask.shape, 4))
-    overlay_rgba[mask] = [1, 0, 0, 0.45]
-    axes[1, 1].imshow(edited_img)
-    axes[1, 1].imshow(overlay_rgba)
-    pct = mask.mean() * 100
-    axes[1, 1].set_title(f"{method_label} Mask ({pct:.1f}% changed)")
-    axes[1, 1].axis("off")
+    overlay = np.zeros((*mask.shape, 4))
+    overlay[mask] = [1, 0, 0, 0.45]
+    axes[1, 1].imshow(edited_img); axes[1, 1].imshow(overlay)
+    axes[1, 1].set_title(f"{label} mask ({mask.mean()*100:.1f}% changed)"); axes[1, 1].axis("off")
 
-    plt.suptitle(f"{method_label} — {dataset}", fontsize=14, fontweight="bold")
+    plt.suptitle(f"{label} — {dataset}", fontsize=14, fontweight="bold")
     plt.tight_layout()
-
-    fname = f"{method_label.lower().replace(' ', '_').replace('+', '_')}_{dataset}.png"
-    path = os.path.join(output_folder, fname)
+    fname = f"{label.lower().replace(' ', '_').replace('+', '_')}_{dataset}.png"
+    path  = os.path.join(out_dir, fname)
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {path}")
     return path
 
 
-def save_summary_png(original_img, edited_img, results, output_folder, dataset):
-    """
-    Save a summary comparison PNG with all masks shown side by side in one row.
-    """
-    method_names = list(results.keys())
-    n = len(method_names)
-    # Columns: original, edited, then one column per method mask
-    ncols = 2 + n
-    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4))
+def _save_summary_png(original_img, edited_img, results, out_dir, dataset, gt_changed=None):
+    n     = len(results)
+    ncols = max(3, n)
+    fig, axes = plt.subplots(2, ncols, figsize=(4 * ncols, 8))
+    plt.subplots_adjust(hspace=0.15, wspace=0.05)
 
-    axes[0].imshow(original_img)
-    axes[0].set_title("Original")
-    axes[0].axis("off")
+    # Row 0: Original, Edited, GT change mask
+    axes[0, 0].imshow(original_img)
+    axes[0, 0].set_title("Original"); axes[0, 0].axis("off")
 
-    axes[1].imshow(edited_img)
-    axes[1].set_title("Edited")
-    axes[1].axis("off")
+    axes[0, 1].imshow(edited_img)
+    axes[0, 1].set_title("Edited"); axes[0, 1].axis("off")
 
-    for i, name in enumerate(method_names):
-        ax = axes[2 + i]
-        data = results[name]
+    if gt_changed is not None:
+        overlay_gt = np.zeros((*gt_changed.shape, 4), dtype=np.float32)
+        overlay_gt[gt_changed]  = [1, 0, 0, 0.6]
+        overlay_gt[~gt_changed] = [0, 1, 0, 0.15]
+        axes[0, 2].imshow(edited_img)
+        axes[0, 2].imshow(overlay_gt)
+        axes[0, 2].set_title(f"GT change mask\n({gt_changed.mean()*100:.1f}% changed)")
+    else:
+        axes[0, 2].text(0.5, 0.5, "GT mask\nnot available",
+                        ha='center', va='center', transform=axes[0, 2].transAxes, fontsize=11)
+    axes[0, 2].axis("off")
+
+    for j in range(3, ncols):
+        axes[0, j].axis("off")
+
+    # Row 1: method masks (F1/IoU in title when GT scores are available)
+    for i, (name, data) in enumerate(results.items()):
         mask = data["mask"]
-        overlay_rgba = np.zeros((*mask.shape, 4))
-        overlay_rgba[mask] = [1, 0, 0, 0.5]
-        ax.imshow(edited_img)
-        ax.imshow(overlay_rgba)
-        pct = mask.mean() * 100
-        ax.set_title(f"{name}\n({pct:.1f}%)")
-        ax.axis("off")
+        overlay = np.zeros((*mask.shape, 4))
+        overlay[mask] = [1, 0, 0, 0.5]
+        axes[1, i].imshow(edited_img)
+        axes[1, i].imshow(overlay)
+        title = f"{name}\n({mask.mean()*100:.1f}%)"
+        if gt_changed is not None and 'scores' in data:
+            s = data['scores']
+            title += f"\nF1={s['f1']:.2f}  IoU={s['iou']:.2f}"
+        axes[1, i].set_title(title); axes[1, i].axis("off")
+
+    for i in range(n, ncols):
+        axes[1, i].axis("off")
 
     plt.suptitle(f"Summary — {dataset}", fontsize=14, fontweight="bold")
     plt.tight_layout()
-
-    path = os.path.join(output_folder, f"summary_{dataset}.png")
+    path = os.path.join(out_dir, f"summary_{dataset}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"  Saved: {path}")
-    return path
 
 
-# ---------------------------------------------------------------------------
-# Sweep (kept for backwards compatibility)
-# ---------------------------------------------------------------------------
-
-def sweep_thresholds(original_img, edited_img, output_folder, dataset, no_show=False):
-    """
-    Grid search over RGB and DINOv2 thresholds to find best mask parameters.
-    Computes feature maps once, then varies thresholds cheaply.
-    Reports best single method and best combo by IoU when reference mask exists.
-    """
-    from transformers import AutoImageProcessor, AutoModel
-
-    h, w = np.array(original_img).shape[:2]
-
-    # --- Compute all diff maps once ---
-
-    # RGB
-    arr1 = np.array(original_img).astype(float)
-    arr2 = np.array(edited_img).astype(float)
-    rgb_diff = np.abs(arr1 - arr2).mean(axis=2)
-    print("Computed RGB diff map")
-
-    # DINOv2
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    dino_model_name = "facebook/dinov2-with-registers-base"
-    print(f"Loading DINOv2 model ({dino_model_name})...")
-    processor = AutoImageProcessor.from_pretrained(dino_model_name, size={"height": 518, "width": 518}, crop_size={"height": 518, "width": 518})
-    model = AutoModel.from_pretrained(dino_model_name).to(device)
-    model.eval()
-    num_register = 4 if "reg" in dino_model_name else 0
-
-    with torch.no_grad():
-        inputs1 = processor(images=original_img, return_tensors="pt").to(device)
-        inputs2 = processor(images=edited_img, return_tensors="pt").to(device)
-        outputs1 = model(**inputs1, output_hidden_states=True)
-        outputs2 = model(**inputs2, output_hidden_states=True)
-        skip = 1 + num_register
-        selected1 = [outputs1.hidden_states[i][:, skip:, :] for i in [3, 6, 9, 12]]
-        selected2 = [outputs2.hidden_states[i][:, skip:, :] for i in [3, 6, 9, 12]]
-        features1 = torch.cat(selected1, dim=-1)
-        features2 = torch.cat(selected2, dim=-1)
-        f1_norm = features1 / features1.norm(dim=-1, keepdim=True)
-        f2_norm = features2 / features2.norm(dim=-1, keepdim=True)
-        distance = 1 - (f1_norm * f2_norm).sum(dim=-1).squeeze()
-
-    num_patches = distance.shape[0]
-    grid_size = int(np.sqrt(num_patches))
-    distance_map = distance.reshape(1, 1, grid_size, grid_size)
-    dino_diff = F.interpolate(distance_map, size=(h, w), mode='bilinear', align_corners=False)
-    dino_diff = dino_diff.squeeze().cpu().numpy()
-    dino_diff = ndimage.gaussian_filter(dino_diff, sigma=4)
-    del model, processor
-    torch.cuda.empty_cache()
-    print("Computed DINOv2 diff map")
-
-    # --- Threshold ranges per method ---
-    methods = {
-        'RGB':   {'diff': rgb_diff,   'thresholds': [10, 15, 20, 25, 30, 40], 'min_area': 100},
-        'DINOv2':{'diff': dino_diff,  'thresholds': [0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5], 'min_area': 500},
-    }
-
-    # Load reference mask if available
-    # --- Single-method sweep ---
-    print("\n" + "=" * 60)
-    print("SINGLE METHOD SWEEP")
-    print("=" * 60)
-
-    best_single = []
-    for name, cfg in methods.items():
-        print(f"\n--- {name} ---")
-        print(f"{'Thresh':>8} {'Pct%':>6}")
-        for t in cfg['thresholds']:
-            mask = refine_mask((cfg['diff'] > t).copy(), min_area=cfg['min_area'])
-            pct = mask.mean() * 100
-            print(f"{t:>8} {pct:>6.1f}")
-            best_single.append({'method': name, 'thresh': t, 'pct': pct, 'mask': mask})
-
-    # --- Combo sweep (pairwise intersections) ---
-    print("\n" + "=" * 60)
-    print("COMBO SWEEP (pairwise intersections)")
-    print("=" * 60)
-
-    method_names = list(methods.keys())
-    best_combo = []
-    for i in range(len(method_names)):
-        for j in range(i + 1, len(method_names)):
-            n1, n2 = method_names[i], method_names[j]
-            c1, c2 = methods[n1], methods[n2]
-            combo_name = f"{n1} & {n2}"
-            print(f"\n--- {combo_name} ---")
-            print(f"{n1:>8} {n2:>8} {'Pct%':>6}")
-            for t1 in c1['thresholds']:
-                m1 = refine_mask((c1['diff'] > t1).copy(), min_area=c1['min_area'])
-                for t2 in c2['thresholds']:
-                    m2 = refine_mask((c2['diff'] > t2).copy(), min_area=c2['min_area'])
-                    inter_mask = m1 & m2
-                    pct = inter_mask.mean() * 100
-                    print(f"{t1:>8} {t2:>8} {pct:>6.1f}")
-                    best_combo.append({'combo': combo_name, 't1': t1, 't2': t2,
-                                       'pct': pct, 'mask': inter_mask})
-
-    # --- Visualization: RGB x DINOv2 grid ---
-    rgb_thresholds = methods['RGB']['thresholds']
-    dino_thresholds = methods['DINOv2']['thresholds']
-    n_rows = len(rgb_thresholds)
-    n_cols = len(dino_thresholds)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(2.5 * n_cols, 2.5 * n_rows))
-
-    for i, rt in enumerate(rgb_thresholds):
-        rgb_m = refine_mask((rgb_diff > rt).copy(), min_area=100)
-        for j, dt in enumerate(dino_thresholds):
-            dino_m = refine_mask((dino_diff > dt).copy(), min_area=500)
-            inter_mask = rgb_m & dino_m
-            inter_pct = inter_mask.mean() * 100
-
-            ax = axes[i, j]
-            ax.imshow(edited_img)
-            overlay = np.zeros((*inter_mask.shape, 4))
-            overlay[inter_mask] = [1, 0, 0, 0.5]
-            ax.imshow(overlay)
-            ax.axis('off')
-
-            label = f"{inter_pct:.1f}%"
-            ax.set_title(label, fontsize=8)
-
-            if i == 0:
-                ax.set_title(f"D={dt:.2f}\n{label}", fontsize=8)
-            if j == 0:
-                ax.set_ylabel(f"RGB={rt}", fontsize=9)
-
-    plt.suptitle(f'Mask Sweep: RGB threshold (rows) x DINOv2 threshold (cols)\n{dataset}',
-                 fontsize=12, fontweight='bold')
-    plt.tight_layout()
-
-    sweep_path = os.path.join(output_folder, f"sweep_{dataset}.png")
-    plt.savefig(sweep_path, dpi=150, bbox_inches='tight')
-    print(f"\nSweep visualization saved: {sweep_path}")
-
-    if not no_show:
-        plt.show()
+def _clean_old_outputs(out_dir, dataset):
+    removed = []
+    for pat in [f"*_{dataset}.png", f"change_detection_{dataset}.png"]:
+        for f in glob.glob(os.path.join(out_dir, pat)):
+            os.remove(f); removed.append(os.path.basename(f))
+    if removed:
+        print(f"Cleaned: {', '.join(removed)}")
 
 
 # ---------------------------------------------------------------------------
@@ -690,178 +468,216 @@ def sweep_thresholds(original_img, edited_img, output_folder, dataset, no_show=F
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Test change detection models')
-    parser.add_argument('--dataset', type=str, default=DEFAULT_DATASET,
-                        help='Dataset folder name (e.g., depth4)')
-    parser.add_argument('--rgb-threshold', type=int, default=25,
-                        help='RGB difference threshold (0-255)')
-    parser.add_argument('--dino-threshold', type=float, default=0.35,
-                        help='DINOv2 feature distance threshold (0-1)')
-    parser.add_argument('--gescf-threshold', type=float, default=None,
-                        help='GeSCF threshold (default: adaptive/skewness-based)')
-    parser.add_argument('--no-show', action='store_true',
-                        help='Do not display figures')
-    parser.add_argument('--skip-dino', action='store_true',
-                        help='Skip DINOv2 method')
-    parser.add_argument('--skip-gescf', action='store_true',
-                        help='Skip GeSCF-style SAM method')
-    parser.add_argument('--skip-crossattn', action='store_true',
-                        help='Skip DINOv2+CrossAttn method')
-    parser.add_argument('--crossattn-threshold', type=float, default=0.5,
-                        help='CrossAttn probability threshold (default 0.5, lower=more sensitive)')
-    parser.add_argument('--crossattn-model', type=str, default='dino_2Cross_PSCD',
-                        choices=['dino_2Cross_CMU', 'dino_2Cross_PSCD', 'dino_2Cross_DiffCMU'],
-                        help='CrossAttn pretrained model variant')
-    parser.add_argument('--sweep', action='store_true',
-                        help='Run threshold sweep over RGB + DINOv2')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(description='Run change detection methods on a dataset pair.')
+    p.add_argument('--dataset',             default=DEFAULT_DATASET,
+                   choices=AVAILABLE_DATASETS)
+    p.add_argument('--rgb-threshold',       type=int,   default=RGB_BASELINE['threshold'])
+    p.add_argument('--dino-threshold',      type=float, default=DINO_BASELINE['threshold'])
+    p.add_argument('--dino-sigma',          type=int,   default=DINO_BASELINE['sigma'])
+    p.add_argument('--dino-min-area',       type=int,   default=DINO_BASELINE['min_area'])
+    p.add_argument('--dino-dilate',         type=int,   default=DINO_BASELINE['dilate_iter'])
+    p.add_argument('--gescf-threshold',     type=float, default=None,
+                   help='GeSCF threshold (default: adaptive/skewness-based)')
+    p.add_argument('--crossattn-threshold', type=float, default=CROSSATTN_BASELINE['threshold'])
+    p.add_argument('--crossattn-model',     default=CROSSATTN_BASELINE['model'],
+                   choices=['dino_2Cross_CMU', 'dino_2Cross_PSCD', 'dino_2Cross_DiffCMU'])
+    p.add_argument('--skip-dino',      action='store_true')
+    p.add_argument('--skip-gescf',     action='store_true')
+    p.add_argument('--skip-crossattn', action='store_true')
+    p.add_argument('--no-show',        action='store_true')
+    # GT depth scoring (optional — enables per-method scoring vs ground truth)
+    p.add_argument('--gt-depth-orig',    default=None,
+                   help='Path to original GT depth EXR (for GT mask derivation)')
+    p.add_argument('--gt-depth-edit',    default=None,
+                   help='Path to edited GT depth EXR (for GT mask derivation)')
+    p.add_argument('--change-threshold', type=float, default=DEFAULT_CHANGE_THRESHOLD,
+                   help='Depth diff threshold (m) to derive GT change mask')
+    args = p.parse_args()
 
-    # Setup paths
-    data_folder = os.path.join(PROJECT_ROOT, "data", args.dataset)
-    output_folder = os.path.join(SCRIPT_DIR, args.dataset)
-    os.makedirs(output_folder, exist_ok=True)
+    data_dir = os.path.join(PROJECT_ROOT, "data", args.dataset)
+    out_dir  = os.path.join(SCRIPT_DIR, args.dataset)
+    os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 60)
     print("CHANGE DETECTION MODEL COMPARISON")
     print("=" * 60)
     print(f"Dataset: {args.dataset}")
 
-    # Find images
-    original_path, edited_path = find_image_pair(data_folder)
+    original_path, edited_path = find_image_pair(data_dir)
     if not original_path or not edited_path:
-        raise FileNotFoundError(f"Could not find image pair in {data_folder}")
-
+        raise FileNotFoundError(f"Could not find image pair in {data_dir}")
     print(f"Original: {os.path.basename(original_path)}")
     print(f"Edited:   {os.path.basename(edited_path)}")
 
-    # Load images
-    original_img = load_image(original_path)
-    edited_img = load_image(edited_path)
+    # Auto-detect GT depths if not provided, or fall back to auto-discovery
+    gt_depth_orig_path = args.gt_depth_orig
+    gt_depth_edit_path = args.gt_depth_edit
+    if gt_depth_orig_path is None and gt_depth_edit_path is None:
+        auto_orig, auto_edit = find_depth_pair(data_dir)
+        if auto_orig and auto_edit:
+            gt_depth_orig_path = auto_orig
+            gt_depth_edit_path = auto_edit
+            print(f"Auto-detected GT depths:")
+            print(f"  orig: {os.path.basename(gt_depth_orig_path)}")
+            print(f"  edit: {os.path.basename(gt_depth_edit_path)}")
 
-    # Resize edited to match original if needed
+    gt_scoring = (gt_depth_orig_path is not None and gt_depth_edit_path is not None)
+    if gt_scoring:
+        print(f"GT scoring enabled (threshold={args.change_threshold} m)")
+    else:
+        print("GT scoring disabled (no GT depth pair found)")
+
+    original_img = load_image(original_path)
+    edited_img   = load_image(edited_path)
     if edited_img.size != original_img.size:
         edited_img = edited_img.resize(original_img.size, Image.BILINEAR)
-
     print(f"Image size: {original_img.size}")
 
-    if args.sweep:
-        sweep_thresholds(original_img, edited_img, output_folder, args.dataset, args.no_show)
-        print("\nDone!")
-        return
+    # ── Load GT depths and derive GT change mask ─────────────────────────────
+    gt_changed = None
+    if gt_scoring:
+        depth_gt_orig = load_exr_depth(gt_depth_orig_path)
+        depth_gt_edit = load_exr_depth(gt_depth_edit_path)
+        h, w = np.array(original_img).shape[:2]
+        # Resize depth maps to image resolution if needed
+        def _resize_depth(d, h, w):
+            if d.shape == (h, w):
+                return d
+            from PIL import Image as _PIL
+            return np.array(
+                _PIL.fromarray(d.astype(np.float32)).resize((w, h), _PIL.BILINEAR)
+            )
+        depth_gt_orig = _resize_depth(depth_gt_orig, h, w)
+        depth_gt_edit = _resize_depth(depth_gt_edit, h, w)
+        gt_changed = np.abs(depth_gt_edit - depth_gt_orig) > args.change_threshold
+        print(f"GT change mask: {gt_changed.sum():,} changed px "
+              f"({gt_changed.mean()*100:.1f}%) at threshold {args.change_threshold} m")
 
-    # Clean old outputs
-    clean_old_outputs(output_folder, args.dataset)
-
+    _clean_old_outputs(out_dir, args.dataset)
     results = {}
 
-    # -----------------------------------------------------------------------
-    # Method 1: RGB Threshold (baseline)
-    # -----------------------------------------------------------------------
-    print("\n" + "-" * 40)
-    print("Method 1: RGB Threshold Baseline")
-    print("-" * 40)
-    rgb_mask, rgb_diff = rgb_threshold_mask(original_img, edited_img, threshold=args.rgb_threshold)
-    rgb_mask_refined = refine_mask(rgb_mask.copy(), min_area=100)
-    print(f"  Threshold: {args.rgb_threshold}")
-    print(f"  Changed pixels: {rgb_mask.sum():,} ({rgb_mask.mean()*100:.1f}%)")
-    print(f"  After refinement: {rgb_mask_refined.sum():,} ({rgb_mask_refined.mean()*100:.1f}%)")
-    results['RGB'] = {'mask': rgb_mask_refined, 'diff_map': rgb_diff}
-    np.save(os.path.join(output_folder, f"rgb_{args.dataset}_mask.npy"), rgb_mask_refined)
-    save_method_png(original_img, edited_img, rgb_diff, rgb_mask_refined,
-                    "RGB", output_folder, args.dataset, vmax=80)
+    # ── RGB ──────────────────────────────────────────────────────────────────
+    print("\n--- RGB threshold ---")
+    rgb_mask, rgb_diff = rgb_threshold_mask(
+        original_img, edited_img,
+        threshold=args.rgb_threshold,
+        min_area=RGB_BASELINE['min_area'],
+        dilate_iter=RGB_BASELINE['dilate_iter'],
+    )
+    print(f"  threshold={args.rgb_threshold}  changed={rgb_mask.mean()*100:.1f}%")
+    results['RGB'] = {'mask': rgb_mask, 'diff_map': rgb_diff}
+    np.save(os.path.join(out_dir, f"rgb_{args.dataset}_mask.npy"), rgb_mask)
+    _save_method_png(original_img, edited_img, rgb_diff, rgb_mask, "RGB", out_dir, args.dataset, vmax=80)
 
-    # -----------------------------------------------------------------------
-    # Method 2: DINOv2 Features
-    # -----------------------------------------------------------------------
+    # ── DINOv2 ───────────────────────────────────────────────────────────────
     if not args.skip_dino:
-        print("\n" + "-" * 40)
-        print("Method 2: DINOv2 Semantic Features")
-        print("-" * 40)
+        print("\n--- DINOv2 ---")
         try:
             dino_mask, dino_diff = dinov2_feature_mask(
                 original_img, edited_img,
                 threshold=args.dino_threshold,
-                model_name="facebook/dinov2-with-registers-base"
+                sigma=args.dino_sigma,
+                min_area=args.dino_min_area,
+                dilate_iter=args.dino_dilate,
             )
-            dino_mask_refined = refine_mask(dino_mask.copy(), min_area=500)
-            print(f"  Threshold: {args.dino_threshold}")
-            print(f"  Changed pixels: {dino_mask.sum():,} ({dino_mask.mean()*100:.1f}%)")
-            print(f"  After refinement: {dino_mask_refined.sum():,} ({dino_mask_refined.mean()*100:.1f}%)")
-            results['DINOv2'] = {'mask': dino_mask_refined, 'diff_map': dino_diff}
-            np.save(os.path.join(output_folder, f"dinov2_{args.dataset}_mask.npy"), dino_mask_refined)
-            save_method_png(original_img, edited_img, dino_diff, dino_mask_refined,
-                            "DINOv2", output_folder, args.dataset, vmax=0.5)
+            print(f"  threshold={args.dino_threshold}  sigma={args.dino_sigma}  changed={dino_mask.mean()*100:.1f}%")
+            results['DINOv2'] = {'mask': dino_mask, 'diff_map': dino_diff}
+            np.save(os.path.join(out_dir, f"dinov2_{args.dataset}_mask.npy"), dino_mask)
+            _save_method_png(original_img, edited_img, dino_diff, dino_mask,
+                             "DINOv2", out_dir, args.dataset, vmax=0.5)
         except Exception as e:
             print(f"  ERROR: {e}")
-            import traceback
-            traceback.print_exc()
 
-    # -----------------------------------------------------------------------
-    # Method 3: GeSCF-style (SAM Q/K/V attention features)
-    # -----------------------------------------------------------------------
+    # ── GeSCF ────────────────────────────────────────────────────────────────
     if not args.skip_gescf:
-        print("\n" + "-" * 40)
-        print("Method 3: GeSCF-style (SAM Q/K/V features)")
-        print("-" * 40)
+        print("\n--- GeSCF ---")
         try:
             gescf_mask, gescf_diff = gescf_feature_mask(
                 original_img, edited_img,
                 threshold=args.gescf_threshold,
+                **GESCF_BASELINE,
             )
-            # No extra refine_mask — gescf already does SAM-based refinement
-            print(f"  Changed pixels: {gescf_mask.sum():,} ({gescf_mask.mean()*100:.1f}%)")
+            print(f"  changed={gescf_mask.mean()*100:.1f}%")
             results['GeSCF'] = {'mask': gescf_mask, 'diff_map': gescf_diff}
-            np.save(os.path.join(output_folder, f"gescf_{args.dataset}_mask.npy"), gescf_mask)
-            save_method_png(original_img, edited_img, gescf_diff, gescf_mask,
-                            "GeSCF", output_folder, args.dataset, vmax=1.0)
+            np.save(os.path.join(out_dir, f"gescf_{args.dataset}_mask.npy"), gescf_mask)
+            _save_method_png(original_img, edited_img, gescf_diff, gescf_mask,
+                             "GeSCF", out_dir, args.dataset, vmax=1.0)
         except Exception as e:
             print(f"  SKIPPED: {e}")
-            import traceback
-            traceback.print_exc()
 
-    # -----------------------------------------------------------------------
-    # Method 4: DINOv2+CrossAttention (pretrained scene change detection)
-    # -----------------------------------------------------------------------
+    # ── CrossAttn ────────────────────────────────────────────────────────────
     if not args.skip_crossattn:
-        print("\n" + "-" * 40)
-        print("Method 4: DINOv2+CrossAttn (ICRA 2025)")
-        print("-" * 40)
+        print("\n--- CrossAttn ---")
         try:
-            crossattn_mask, crossattn_prob = dino_crossattn_mask(
+            ca_mask, ca_prob = dino_crossattn_mask(
                 original_img, edited_img,
                 threshold=args.crossattn_threshold,
                 pretrained=args.crossattn_model,
             )
-            print(f"  Changed pixels: {crossattn_mask.sum():,} ({crossattn_mask.mean()*100:.1f}%)")
-            results['CrossAttn'] = {'mask': crossattn_mask, 'diff_map': crossattn_prob}
-            np.save(os.path.join(output_folder, f"crossattn_{args.dataset}_mask.npy"), crossattn_mask)
-            save_method_png(original_img, edited_img, crossattn_prob, crossattn_mask,
-                            "CrossAttn", output_folder, args.dataset, vmax=1.0)
+            print(f"  changed={ca_mask.mean()*100:.1f}%")
+            results['CrossAttn'] = {'mask': ca_mask, 'diff_map': ca_prob}
+            np.save(os.path.join(out_dir, f"crossattn_{args.dataset}_mask.npy"), ca_mask)
+            _save_method_png(original_img, edited_img, ca_prob, ca_mask,
+                             "CrossAttn", out_dir, args.dataset, vmax=1.0)
         except Exception as e:
             print(f"  SKIPPED: {e}")
-            import traceback
-            traceback.print_exc()
 
-    # -----------------------------------------------------------------------
-    # Comparison & Summary
-    # -----------------------------------------------------------------------
-    print("\n" + "=" * 60)
-    print("COMPARISON (pairwise IoU)")
-    print("=" * 60)
+    # ── Pairwise IoU summary ──────────────────────────────────────────────────
+    if len(results) > 1:
+        print("\n--- Pairwise IoU ---")
+        keys = list(results.keys())
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                a, b = results[keys[i]]['mask'], results[keys[j]]['mask']
+                inter = np.logical_and(a, b).sum()
+                union = np.logical_or(a, b).sum()
+                iou   = inter / union if union > 0 else 0.0
+                print(f"  {keys[i]:>10} vs {keys[j]:<10}  IoU={iou:.3f}")
 
-    method_keys = list(results.keys())
-    for i in range(len(method_keys)):
-        for j in range(i + 1, len(method_keys)):
-            name_a, name_b = method_keys[i], method_keys[j]
-            metrics = compute_mask_metrics(results[name_a]['mask'], results[name_b]['mask'])
-            print(f"  {name_a:>10} vs {name_b:<10} IoU: {metrics['iou']:.3f}")
+    # ── GT mask scoring (before summary so scores appear in image titles) ────────
+    detection_scores = None
+    if gt_scoring and gt_changed is not None and results:
+        detection_scores = {
+            'change_threshold_m': args.change_threshold,
+            'gt_changed_pixels':  int(gt_changed.sum()),
+            'gt_changed_frac':    float(gt_changed.mean()),
+            'methods': {},
+        }
+        for name, data in results.items():
+            mask = data['mask']
+            if mask.shape != gt_changed.shape:
+                mask = np.array(
+                    Image.fromarray(mask.astype(np.uint8) * 255).resize(
+                        (gt_changed.shape[1], gt_changed.shape[0]), Image.NEAREST
+                    )
+                ) > 127
+            scores = _score_mask(mask, gt_changed)
+            detection_scores['methods'][name] = scores
+            results[name]['scores'] = scores  # stored so summary can show F1/IoU in titles
 
-    # Save summary PNG
     if results:
-        save_summary_png(original_img, edited_img, results, output_folder,
-                         args.dataset)
+        _save_summary_png(original_img, edited_img, results, out_dir, args.dataset,
+                          gt_changed=gt_changed)
 
-    print("\nDone!")
+    # ── Print scores + save JSON ──────────────────────────────────────────────
+    if detection_scores is not None:
+        print("\n" + "=" * 65)
+        print("SCORING vs GT CHANGE MASK")
+        print("=" * 65)
+        print(f"{'Method':<12} {'Precision':>10} {'Recall':>10} {'F1':>10} {'IoU':>10}")
+        print("-" * 65)
+        for name in results:
+            s = detection_scores['methods'][name]
+            print(f"{name:<12} {s['precision']:>10.3f} {s['recall']:>10.3f} "
+                  f"{s['f1']:>10.3f} {s['iou']:>10.3f}")
+        print("=" * 65)
+
+        scores_path = os.path.join(out_dir, "detection_scores.json")
+        with open(scores_path, 'w') as f:
+            json.dump(detection_scores, f, indent=2)
+        print(f"\nScores saved: {scores_path}")
+
+    print("\nDone.")
 
 
 if __name__ == "__main__":
