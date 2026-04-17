@@ -34,8 +34,6 @@ data/
 output/
 pointclouds/
 MAIN_TEST/pointclouds_*/
-compare_edit_depth/v1/
-compare_edit_depth/v2/
 
 # Third-party repos
 Robust-Scene-Change-Detection/
