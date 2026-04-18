@@ -15,6 +15,7 @@ Args:
     --scaling           ls | median                              (default: ls)
     --change-threshold  float in metres                          (default: 0.03)
     --no-show           suppress interactive plot window
+    --all-models        run all available models sequentially on the given dataset
 
 Usage examples:
     # defaults: dpro, new0, least-squares
@@ -23,6 +24,7 @@ Usage examples:
     python compare_edit_depth/compare_edit_depth.py --model da3_giant --dataset new1
     python compare_edit_depth/compare_edit_depth.py --model dpro --dataset new0 --scaling median
     python compare_edit_depth/compare_edit_depth.py --model dpro --dataset new0 --change-threshold 0.05 --no-show
+    python compare_edit_depth/compare_edit_depth.py --all-models --dataset new1
 """
 
 import os
@@ -31,6 +33,7 @@ import subprocess
 import tempfile
 import argparse
 import json
+import warnings
 import numpy as np
 import matplotlib
 from PIL import Image
@@ -39,6 +42,7 @@ import Imath
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+warnings.filterwarnings('ignore', 'FigureCanvasAgg is non-interactive')
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -47,9 +51,9 @@ SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT   = os.path.dirname(SCRIPT_DIR)
 OUTPUT_FOLDER  = os.path.join(SCRIPT_DIR, "v1")
 GT_TO_CENTIMETERS        = 10000.0
-DEFAULT_CHANGE_THRESHOLD = 0.05   # metres
+DEFAULT_CHANGE_THRESHOLD = 0.0   # metres
 
-AVAILABLE_DATASETS = ['new0', 'new1']
+AVAILABLE_DATASETS = ['new0', 'new1', 'new2', 'new3']
 DEFAULT_DATASET          = 'new0'
 
 AVAILABLE_MODELS = {
@@ -257,7 +261,10 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
         capture_output=True, text=True, timeout=1800,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Subprocess failed:\n{result.stderr}")
+        raise RuntimeError(
+            f"Subprocess failed (exit {result.returncode}):\n"
+            f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+        )
     return result.stdout.strip()
 
 
@@ -282,6 +289,84 @@ def compute_depth_metrics(pred, gt, mask):
         d1   = float(np.mean(ratio < 1.25)),
         d2   = float(np.mean(ratio < 1.25 ** 2)),
         d3   = float(np.mean(ratio < 1.25 ** 3)),
+    )
+
+
+def _load_world_normal(path):
+    """Load WorldNormal EXR -> unit normals in UE world space (X=fwd, Y=right, Z=up)."""
+    exr_file = OpenEXR.InputFile(path)
+    header   = exr_file.header()
+    dw       = header['dataWindow']
+    width    = dw.max.x - dw.min.x + 1
+    height   = dw.max.y - dw.min.y + 1
+    FLOAT    = Imath.PixelType(Imath.PixelType.FLOAT)
+    ch = []
+    for c in ['R', 'G', 'B']:
+        buf = exr_file.channel(c, FLOAT)
+        ch.append(np.frombuffer(buf, dtype=np.float32).reshape(height, width).copy())
+    raw = np.stack(ch, axis=-1)
+    N   = raw / np.pi - 1.0
+    return N / (np.linalg.norm(N, axis=-1, keepdims=True) + 1e-6)
+
+
+def _normals_from_depth(depth_m, fx, fy, cx, cy):
+    H, W = depth_m.shape
+    uu, vv = np.meshgrid(np.arange(W), np.arange(H))
+    pts = np.stack([(uu - cx) * depth_m / fx,
+                    (vv - cy) * depth_m / fy,
+                    depth_m.copy()], axis=-1)
+    dx = np.roll(pts, -1, axis=1) - np.roll(pts, 1, axis=1)
+    dy = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
+    n  = np.cross(dx, dy)
+    return -n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-6)
+
+
+def _ue_cam_to_world(pitch_deg, yaw_deg, roll_deg):
+    """
+    Camera-to-world rotation for a UE camera.
+    UE world: X=forward, Y=right, Z=up. Screen space: X=right, Y=down, Z=depth.
+    Rotation order: Rz(yaw) @ Ry(pitch) @ Rx(roll)  (extrinsic Z->Y->X).
+    Fill in pitch/yaw/roll from UE Details panel > Transform > Rotation.
+    """
+    p, y, r = np.radians(pitch_deg), np.radians(yaw_deg), np.radians(roll_deg)
+    Rz = np.array([[ np.cos(y), -np.sin(y), 0],
+                   [ np.sin(y),  np.cos(y), 0],
+                   [0, 0, 1]], dtype=float)
+    Ry = np.array([[ np.cos(p), 0, np.sin(p)],
+                   [0, 1, 0],
+                   [-np.sin(p), 0, np.cos(p)]], dtype=float)
+    Rx = np.array([[1, 0, 0],
+                   [0,  np.cos(r), -np.sin(r)],
+                   [0,  np.sin(r),  np.cos(r)]], dtype=float)
+    # Base: UE default camera (P=Y=R=0) looks along world +X
+    # screen-right -> world +Y,  screen-down -> world -Z,  depth -> world +X
+    R_base = np.array([[0, 0, 1],
+                       [1, 0, 0],
+                       [0, -1, 0]], dtype=float)
+    return Rz @ Ry @ Rx @ R_base
+
+
+_SNA_NAN = dict(sna_mean=float('nan'), sna_median=float('nan'),
+                pct_11=float('nan'), pct_22=float('nan'), pct_30=float('nan'))
+
+
+def compute_sna(depth_pred, gt_normals_world, mask, fx, fy, cx, cy, R_cam_to_world):
+    """Surface Normal Alignment vs UE WorldNormal EXR (degrees + threshold %)."""
+    valid = mask & np.isfinite(depth_pred) & (depth_pred > 0.1)
+    if valid.sum() == 0:
+        return _SNA_NAN.copy()
+    n_cam   = _normals_from_depth(depth_pred, fx, fy, cx, cy)
+    n_world = (R_cam_to_world @ n_cam.reshape(-1, 3).T).T.reshape(n_cam.shape)
+    n_world = n_world / (np.linalg.norm(n_world, axis=-1, keepdims=True) + 1e-6)
+    dot = np.clip((n_world * gt_normals_world).sum(axis=-1), -1.0, 1.0)
+    ang = np.degrees(np.arccos(dot))
+    a   = ang[valid]
+    return dict(
+        sna_mean   = float(a.mean()),
+        sna_median = float(np.median(a)),
+        pct_11     = float((a < 11.25).mean() * 100),
+        pct_22     = float((a < 22.5).mean()  * 100),
+        pct_30     = float((a < 30.0).mean()  * 100),
     )
 
 
@@ -318,7 +403,6 @@ def save_gt_mask_png(original_img, edited_img, depth_gt_orig, depth_gt_edit,
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
-    print(f"  GT mask saved: {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +419,26 @@ def main():
     parser.add_argument('--change-threshold', type=float, default=DEFAULT_CHANGE_THRESHOLD,
                         help='Depth difference (m) to mark a pixel as changed')
     parser.add_argument('--no-show', action='store_true')
+    parser.add_argument('--all-models', action='store_true',
+                        help='Run all available models sequentially on the given dataset')
     args = parser.parse_args()
+
+    if args.all_models:
+        print("STARTING")
+        for mk in AVAILABLE_MODELS:
+            print(f"\n--- {AVAILABLE_MODELS[mk]} ---")
+            cmd = [sys.executable, __file__,
+                   '--model', mk,
+                   '--dataset', args.dataset,
+                   '--scaling', args.scaling,
+                   '--change-threshold', str(args.change_threshold)]
+            if args.no_show:
+                cmd.append('--no-show')
+            result = subprocess.run(cmd)
+            if result.returncode != 0:
+                print(f"\n[WARN] {AVAILABLE_MODELS[mk]} failed (exit {result.returncode}), skipping.\n")
+        print("\nFINISHED")
+        return
 
     model_key      = args.model
     model_name     = AVAILABLE_MODELS[model_key]
@@ -351,20 +454,8 @@ def main():
     output_filename = f"{scaling_prefix}_cmp_{model_key}.png"
     output_path     = os.path.join(output_subfolder, output_filename)
 
-    print("=" * 70)
-    print("DEPTH COMPARISON v1 — calibrate on original, evaluate on changed pixels")
-    print("=" * 70)
-    print(f"Model:   {model_name}")
-    print(f"Scaling: {scaling_folder}")
-    print(f"Dataset: {dataset}")
-    print(f"Change threshold: {args.change_threshold} m")
-
     # ── Discover files ──────────────────────────────────────────────────────
     original_path, edited_path, gt_orig_path, gt_edit_path = find_files(input_folder)
-    print(f"\nOriginal RGB:  {os.path.basename(original_path)}")
-    print(f"Edited   RGB:  {os.path.basename(edited_path)}")
-    print(f"GT depth orig: {os.path.basename(gt_orig_path)}")
-    print(f"GT depth edit: {os.path.basename(gt_edit_path)}")
 
     # ── Load images & GT depths ─────────────────────────────────────────────
     original_img  = load_image(original_path)
@@ -373,29 +464,44 @@ def main():
     depth_gt_edit = load_exr_depth(gt_edit_path)
 
     target_shape = depth_gt_orig.shape
-    print(f"\nGT depth orig: {depth_gt_orig.shape}  {depth_gt_orig.min():.2f}–{depth_gt_orig.max():.2f} m")
-    print(f"GT depth edit: {depth_gt_edit.shape}  {depth_gt_edit.min():.2f}–{depth_gt_edit.max():.2f} m")
+    H_gt, W_gt   = target_shape
+    _fx = (W_gt / 2.0) / np.tan(np.radians(90.0) / 2.0)
+    _fy, _cx, _cy = _fx, W_gt / 2.0, H_gt / 2.0
 
     # ── GT change mask ───────────────────────────────────────────────────────
     depth_diff   = depth_gt_edit - depth_gt_orig
     gt_changed   = np.abs(depth_diff) > args.change_threshold
     gt_unchanged = ~gt_changed
-    print(f"\nGT mask: changed={gt_changed.sum():,} ({gt_changed.mean()*100:.1f}%)  "
-          f"unchanged={gt_unchanged.sum():,}")
 
-    # Save GT mask visual check
+    # Save GT mask visual check (skip if already saved by a previous model in --all-models)
     mask_png_path = os.path.join(output_subfolder, f"gt_mask_{dataset}.png")
-    save_gt_mask_png(original_img, edited_img, depth_gt_orig, depth_gt_edit,
-                     gt_changed, depth_diff, args.change_threshold, mask_png_path)
+    if not os.path.exists(mask_png_path):
+        save_gt_mask_png(original_img, edited_img, depth_gt_orig, depth_gt_edit,
+                         gt_changed, depth_diff, args.change_threshold, mask_png_path)
+
+    # ── Load camera params + WorldNormals for SNA ────────────────────────────
+    cam_params_path = os.path.join(input_folder, "camera_params.json")
+    sna_ready = False
+    R_cam_to_world = gt_normals_orig = gt_normals_edit = None
+    if os.path.exists(cam_params_path):
+        with open(cam_params_path) as f:
+            cp = json.load(f)
+        if None not in (cp.get('pitch_deg'), cp.get('yaw_deg'), cp.get('roll_deg')):
+            R_cam_to_world = _ue_cam_to_world(cp['pitch_deg'], cp['yaw_deg'], cp['roll_deg'])
+            wn_orig = gt_orig_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
+            wn_edit = gt_edit_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
+            if os.path.exists(wn_edit):
+                gt_normals_edit = _load_world_normal(wn_edit)
+                sna_ready = True
+            if os.path.exists(wn_orig):
+                gt_normals_orig = _load_world_normal(wn_orig)
 
     # ── Run model on both images ────────────────────────────────────────────
     def _infer(img_path, label):
-        print(f"\nRunning {model_name} on {label} ...")
         with tempfile.NamedTemporaryFile(suffix='.npy', delete=False) as f:
             tmp = f.name
         try:
-            out = run_model_subprocess(model_key, img_path, tmp)
-            print(f"  {out}")
+            run_model_subprocess(model_key, img_path, tmp)
             return np.load(tmp)
         finally:
             if os.path.exists(tmp):
@@ -440,19 +546,30 @@ def main():
     unch_m     = compute_depth_metrics(depth_edited_scaled,   depth_gt_edit,  gt_unchanged)
     ch_m       = compute_depth_metrics(depth_edited_scaled,   depth_gt_edit,  gt_changed)
 
-    print("\n" + "=" * 65)
+    sna_orig_unch = _SNA_NAN.copy()
+    sna_unch      = _SNA_NAN.copy()
+    sna_ch        = _SNA_NAN.copy()
+    if sna_ready:
+        if gt_normals_orig is not None:
+            sna_orig_unch = compute_sna(depth_original_scaled, gt_normals_orig, gt_unchanged, _fx, _fy, _cx, _cy, R_cam_to_world)
+        sna_unch = compute_sna(depth_edited_scaled, gt_normals_edit, gt_unchanged, _fx, _fy, _cx, _cy, R_cam_to_world)
+        sna_ch   = compute_sna(depth_edited_scaled, gt_normals_edit, gt_changed,   _fx, _fy, _cx, _cy, R_cam_to_world)
+
+    def _sf(s): return f"{s['sna_mean']:8.2f}" if not np.isnan(s['sna_mean']) else "     ---"
+
+    print("\n" + "=" * 75)
     print("METRICS")
-    print("=" * 65)
-    print(f"{'Region':<22} {'n':>8} {'MAE (m)':>10} {'RMSE (m)':>10} {'δ1':>8} {'δ2':>8} {'δ3':>8}")
-    print("-" * 65)
-    for label, m in [
-        ("orig vs GT_orig (unch)", orig_unch),
-        ("edit vs GT_edit (unch)", unch_m),
-        ("edit vs GT_edit (chng)", ch_m),
+    print("=" * 75)
+    print(f"{'Region':<22} {'n':>8} {'MAE (m)':>10} {'RMSE (m)':>10} {'δ1':>8} {'δ2':>8} {'δ3':>8} {'SNA(°)':>8}")
+    print("-" * 75)
+    for label, m, sna in [
+        ("orig vs GT_orig (unch)", orig_unch, sna_orig_unch),
+        ("edit vs GT_edit (unch)", unch_m,    sna_unch),
+        ("edit vs GT_edit (chng)", ch_m,      sna_ch),
     ]:
         print(f"{label:<22} {m['n']:>8,} {m['mae']:>10.4f} {m['rmse']:>10.4f} "
-              f"{m['d1']:>8.3f} {m['d2']:>8.3f} {m['d3']:>8.3f}")
-    print("=" * 65)
+              f"{m['d1']:>8.3f} {m['d2']:>8.3f} {m['d3']:>8.3f} {_sf(sna)}")
+    print("=" * 75)
 
     # ── Save JSON metrics ────────────────────────────────────────────────────
     metrics_json_path = os.path.join(output_subfolder, "metrics_data.json")
@@ -466,14 +583,13 @@ def main():
         'scale': scale, 'shift': shift,
         'change_threshold_m': args.change_threshold,
         'gt_changed_frac': float(gt_changed.mean()),
-        'orig_unchanged': orig_unch,
-        'edit_unchanged': unch_m,
-        'edit_changed':   ch_m,
+        'orig_unchanged': {**orig_unch, **sna_orig_unch},
+        'edit_unchanged': {**unch_m,    **sna_unch},
+        'edit_changed':   {**ch_m,      **sna_ch},
     }
 
     with open(metrics_json_path, 'w') as f:
         json.dump(all_metrics, f, indent=2)
-    print(f"\nMetrics saved: {metrics_json_path}")
 
     # ── Main visualization (2×4) ─────────────────────────────────────────────
     from scipy import ndimage
@@ -537,12 +653,6 @@ def main():
     )
     plt.tight_layout()
     plt.savefig(output_path, dpi=150, bbox_inches='tight')
-    print(f"Figure saved: {output_path}")
-
-    if not args.no_show:
-        plt.show()
-
-    print("\nDone!")
 
 
 if __name__ == "__main__":

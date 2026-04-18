@@ -27,8 +27,8 @@ sys.path.insert(0, SCRIPT_DIR)
 
 from params import DINO_BASELINE, GESCF_BASELINE, RGB_BASELINE, CROSSATTN_BASELINE
 
-DEFAULT_DATASET          = "new0"
-DEFAULT_CHANGE_THRESHOLD = 0.05   # metres — for GT mask derivation from depth diff
+DEFAULT_DATASET          = "new3"
+DEFAULT_CHANGE_THRESHOLD = 0.00   # metres — for GT mask derivation from depth diff
 
 AVAILABLE_DATASETS = ['depth4', 'concrete1', 'test2', 'new0', 'new1']
 
@@ -390,7 +390,7 @@ def _save_method_png(original_img, edited_img, diff_map, mask, label, out_dir, d
     overlay = np.zeros((*mask.shape, 4))
     overlay[mask] = [1, 0, 0, 0.45]
     axes[1, 1].imshow(edited_img); axes[1, 1].imshow(overlay)
-    axes[1, 1].set_title(f"{label} mask ({mask.mean()*100:.1f}% changed)"); axes[1, 1].axis("off")
+    axes[1, 1].set_title(f"{label} mask ({mask.mean()*100:.2f}% changed)"); axes[1, 1].axis("off")
 
     plt.suptitle(f"{label} — {dataset}", fontsize=14, fontweight="bold")
     plt.tight_layout()
@@ -421,7 +421,7 @@ def _save_summary_png(original_img, edited_img, results, out_dir, dataset, gt_ch
         overlay_gt[~gt_changed] = [0, 1, 0, 0.15]
         axes[0, 2].imshow(edited_img)
         axes[0, 2].imshow(overlay_gt)
-        axes[0, 2].set_title(f"GT change mask\n({gt_changed.mean()*100:.1f}% changed)")
+        axes[0, 2].set_title(f"GT change mask\n({gt_changed.mean()*100:.2f}% changed)")
     else:
         axes[0, 2].text(0.5, 0.5, "GT mask\nnot available",
                         ha='center', va='center', transform=axes[0, 2].transAxes, fontsize=11)
@@ -437,7 +437,7 @@ def _save_summary_png(original_img, edited_img, results, out_dir, dataset, gt_ch
         overlay[mask] = [1, 0, 0, 0.5]
         axes[1, i].imshow(edited_img)
         axes[1, i].imshow(overlay)
-        title = f"{name}\n({mask.mean()*100:.1f}%)"
+        title = f"{name}\n({mask.mean()*100:.2f}%)"
         if gt_changed is not None and 'scores' in data:
             s = data['scores']
             title += f"\nF1={s['f1']:.2f}  IoU={s['iou']:.2f}"
@@ -458,6 +458,8 @@ def _clean_old_outputs(out_dir, dataset):
     removed = []
     for pat in [f"*_{dataset}.png", f"change_detection_{dataset}.png"]:
         for f in glob.glob(os.path.join(out_dir, pat)):
+            if os.path.basename(f).startswith("gt_mask_"):
+                continue
             os.remove(f); removed.append(os.path.basename(f))
     if removed:
         print(f"Cleaned: {', '.join(removed)}")
@@ -551,7 +553,14 @@ def main():
         depth_gt_edit = _resize_depth(depth_gt_edit, h, w)
         gt_changed = np.abs(depth_gt_edit - depth_gt_orig) > args.change_threshold
         print(f"GT change mask: {gt_changed.sum():,} changed px "
-              f"({gt_changed.mean()*100:.1f}%) at threshold {args.change_threshold} m")
+              f"({gt_changed.mean()*100:.2f}%) at threshold {args.change_threshold} m")
+
+        # Save GT mask
+        depth_diff = np.abs(depth_gt_edit - depth_gt_orig)
+        np.save(os.path.join(out_dir, f"gt_mask_{args.dataset}.npy"), gt_changed)
+        _save_method_png(original_img, edited_img, depth_diff, gt_changed,
+                         "GT mask", out_dir, args.dataset,
+                         vmax=np.percentile(depth_diff, 99))
 
     _clean_old_outputs(out_dir, args.dataset)
     results = {}
@@ -564,7 +573,7 @@ def main():
         min_area=RGB_BASELINE['min_area'],
         dilate_iter=RGB_BASELINE['dilate_iter'],
     )
-    print(f"  threshold={args.rgb_threshold}  changed={rgb_mask.mean()*100:.1f}%")
+    print(f"  threshold={args.rgb_threshold}  changed={rgb_mask.mean()*100:.2f}%")
     results['RGB'] = {'mask': rgb_mask, 'diff_map': rgb_diff}
     np.save(os.path.join(out_dir, f"rgb_{args.dataset}_mask.npy"), rgb_mask)
     _save_method_png(original_img, edited_img, rgb_diff, rgb_mask, "RGB", out_dir, args.dataset, vmax=80)
@@ -580,7 +589,7 @@ def main():
                 min_area=args.dino_min_area,
                 dilate_iter=args.dino_dilate,
             )
-            print(f"  threshold={args.dino_threshold}  sigma={args.dino_sigma}  changed={dino_mask.mean()*100:.1f}%")
+            print(f"  threshold={args.dino_threshold}  sigma={args.dino_sigma}  changed={dino_mask.mean()*100:.2f}%")
             results['DINOv2'] = {'mask': dino_mask, 'diff_map': dino_diff}
             np.save(os.path.join(out_dir, f"dinov2_{args.dataset}_mask.npy"), dino_mask)
             _save_method_png(original_img, edited_img, dino_diff, dino_mask,
@@ -597,7 +606,7 @@ def main():
                 threshold=args.gescf_threshold,
                 **GESCF_BASELINE,
             )
-            print(f"  changed={gescf_mask.mean()*100:.1f}%")
+            print(f"  changed={gescf_mask.mean()*100:.2f}%")
             results['GeSCF'] = {'mask': gescf_mask, 'diff_map': gescf_diff}
             np.save(os.path.join(out_dir, f"gescf_{args.dataset}_mask.npy"), gescf_mask)
             _save_method_png(original_img, edited_img, gescf_diff, gescf_mask,
@@ -614,7 +623,7 @@ def main():
                 threshold=args.crossattn_threshold,
                 pretrained=args.crossattn_model,
             )
-            print(f"  changed={ca_mask.mean()*100:.1f}%")
+            print(f"  changed={ca_mask.mean()*100:.2f}%")
             results['CrossAttn'] = {'mask': ca_mask, 'diff_map': ca_prob}
             np.save(os.path.join(out_dir, f"crossattn_{args.dataset}_mask.npy"), ca_mask)
             _save_method_png(original_img, edited_img, ca_prob, ca_mask,
