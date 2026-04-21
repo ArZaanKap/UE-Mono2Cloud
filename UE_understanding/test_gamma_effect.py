@@ -24,7 +24,7 @@ FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
 DATASET_DIR   = os.path.join(PROJECT_ROOT, "data", "depth4")
 EXR_PATH      = os.path.join(DATASET_DIR, "HighresScreenshot00000.exr")
 EDIT_PATH     = os.path.join(DATASET_DIR, "edit.png")
-BASELINE_MASK = os.path.join(PROJECT_ROOT, "change_detection_results", "depth4", "gescf_depth4_mask.npy")
+BASELINE_MASK = os.path.join(PROJECT_ROOT, "change_detection_results", "depth4", "gt_mask_depth4.npy")
 
 
 # ── Two EXR loading strategies ──────────────────────────────────────────────
@@ -157,7 +157,7 @@ def main():
     mask_stats(mask_A,        "A: linear (current)")
     mask_stats(mask_B,        "B: gamma  (proposed)")
     if mask_baseline is not None:
-        mask_stats(mask_baseline, "Baseline (from disk)")
+        mask_stats(mask_baseline, "GT mask (ground truth)")
 
     compare_masks(mask_A, mask_B, "A", "B")
     if mask_baseline is not None:

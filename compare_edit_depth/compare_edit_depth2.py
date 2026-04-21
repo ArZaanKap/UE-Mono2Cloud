@@ -14,9 +14,9 @@ Key difference from v1 (compare_edit_depth.py):
   v2: scale factor from edited prediction vs GT (unchanged pixels only)
 
 Args:
-    --model             dpro | da3_giant | da3_nested | marigold_dc  (default: dpro)
+    --model             dpro | da3_giant | da3_nested | marigold_dc | depthlab  (default: dpro)
     --dataset           new0 | new1 | depth4 | concrete1 | test2     (default: new0)
-    --scaling           ls | median   (ignored for marigold_dc)       (default: ls)
+    --scaling           ls | median   (ignored for marigold_dc / depthlab)     (default: ls)
     --change-threshold  float in metres                               (default: 0.05)
     --no-show           suppress interactive plot window
     --all-models        run all available models sequentially on the given dataset
@@ -28,6 +28,7 @@ Usage examples:
     python compare_edit_depth/compare_edit_depth2.py --model da3_giant --dataset new1
     python compare_edit_depth/compare_edit_depth2.py --model dpro --dataset new0 --scaling median
     python compare_edit_depth/compare_edit_depth2.py --model marigold_dc --dataset new0
+    python compare_edit_depth/compare_edit_depth2.py --model depthlab --dataset new0
     python compare_edit_depth/compare_edit_depth2.py --model dpro --dataset new0 --change-threshold 0.02 --no-show
     python compare_edit_depth/compare_edit_depth2.py --all-models --dataset new1
 """
@@ -58,8 +59,9 @@ OUTPUT_FOLDER   = os.path.join(SCRIPT_DIR, "v2")
 GT_TO_CENTIMETERS        = 10000.0
 DEFAULT_CHANGE_THRESHOLD = 0.0   # metres
 MARIGOLD_MAX_RESOLUTION  = 768
+DEPTHLAB_MAX_RESOLUTION  = 768
 
-AVAILABLE_DATASETS = ['new0', 'new1','new2','new3']
+AVAILABLE_DATASETS = ['new0', 'new1','new2','new3','new4']
 DEFAULT_DATASET          = 'new0'
 
 AVAILABLE_MODELS = {
@@ -67,6 +69,7 @@ AVAILABLE_MODELS = {
     'da3_nested':  'DA3 Nested Giant 1.1',
     'dpro':        'Depth Pro',
     'marigold_dc': 'Marigold-DC',
+    'depthlab':    'DepthLab',
 }
 
 DA3_HF_MODELS = {
@@ -169,13 +172,13 @@ def find_files(folder):
 # Model inference (subprocess)
 # ---------------------------------------------------------------------------
 
-def run_model_subprocess(model_name, rgb_path, output_path, sparse_depth_path=None):
+def run_model_subprocess(model_name, rgb_path, output_path, sparse_depth_path=None, mask_path=None):
     rgb_path_safe    = rgb_path.replace('\\', '/')
     output_path_safe = output_path.replace('\\', '/')
     python_exe       = sys.executable
 
     if model_name == 'marigold_dc':
-        marigold_repo = os.path.join(PROJECT_ROOT, "Marigold-DC")
+        marigold_repo = os.path.join(PROJECT_ROOT, "depth_models", "Marigold-DC")
         if not os.path.isdir(marigold_repo):
             raise FileNotFoundError(f"Marigold-DC repo not found at: {marigold_repo}")
         if sparse_depth_path is None:
@@ -187,6 +190,31 @@ def run_model_subprocess(model_name, rgb_path, output_path, sparse_depth_path=No
              '--out-depth', output_path,
              '--processing_resolution', '0'],
             capture_output=True, text=True, timeout=3600, cwd=marigold_repo,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Subprocess failed (exit {result.returncode}):\n"
+                f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
+            )
+        return result.stdout.strip()
+
+    if model_name == 'depthlab':
+        depthlab_repo = os.path.join(PROJECT_ROOT, "depth_models", "DepthLab")
+        if not os.path.isdir(depthlab_repo):
+            raise FileNotFoundError(f"DepthLab repo not found at: {depthlab_repo}")
+        if sparse_depth_path is None or mask_path is None:
+            raise ValueError("DepthLab requires sparse_depth_path and mask_path")
+        infer_script = os.path.join(SCRIPT_DIR, "depthlab_infer.py")
+        result = subprocess.run(
+            [python_exe, infer_script,
+             '--in-image',       rgb_path,
+             '--in-depth',       sparse_depth_path,
+             '--in-mask',        mask_path,
+             '--out-depth',      output_path,
+             '--depthlab-dir',   depthlab_repo,
+             '--denoise-steps',  '20',
+             '--processing-res', '0'],
+            capture_output=True, text=True, timeout=3600,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -232,7 +260,7 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 torch.set_grad_enabled(False)
 {exr_loader}
-da3_src = Path(r"{PROJECT_ROOT}") / "Depth-Anything-3" / "src"
+da3_src = Path(r"{PROJECT_ROOT}") / "depth_models" / "Depth-Anything-3" / "src"
 if da3_src.exists() and str(da3_src) not in sys.path:
     sys.path.insert(0, str(da3_src))
 from depth_anything_3.api import DepthAnything3
@@ -260,7 +288,7 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
 '''
 
     elif model_name == 'dpro':
-        depth_pro_checkpoint = os.path.join(PROJECT_ROOT, "checkpoints", "depth_pro.pt").replace('\\', '/')
+        depth_pro_checkpoint = os.path.join(PROJECT_ROOT, "depth_models", "checkpoints", "depth_pro.pt").replace('\\', '/')
         script = f'''
 import torch
 import numpy as np
@@ -334,7 +362,7 @@ def _load_world_normal(path):
         buf = exr_file.channel(c, FLOAT)
         ch.append(np.frombuffer(buf, dtype=np.float32).reshape(height, width).copy())
     raw = np.stack(ch, axis=-1)
-    N   = raw / np.pi - 1.0
+    N   = raw - 1.0   # UE stores world normals as N+1 in [0,2]; decode: raw-1
     return N / (np.linalg.norm(N, axis=-1, keepdims=True) + 1e-6)
 
 
@@ -344,10 +372,19 @@ def _normals_from_depth(depth_m, fx, fy, cx, cy):
     pts = np.stack([(uu - cx) * depth_m / fx,
                     (vv - cy) * depth_m / fy,
                     depth_m.copy()], axis=-1)
-    dx = np.roll(pts, -1, axis=1) - np.roll(pts, 1, axis=1)
-    dy = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
-    n  = np.cross(dx, dy)
+    # np.gradient handles image boundaries correctly (no wrap-around artefacts)
+    dy, dx = np.gradient(pts, axis=(0, 1))
+    n = np.cross(dx, dy)
     return -n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-6)
+
+
+def _disc_mask(depth_m, dilate=3):
+    """Pixels at depth discontinuities where finite-diff normals are unreliable."""
+    dx = np.abs(np.roll(depth_m, -1, axis=1) - np.roll(depth_m, 1, axis=1))
+    dy = np.abs(np.roll(depth_m, -1, axis=0) - np.roll(depth_m, 1, axis=0))
+    from scipy.ndimage import binary_dilation
+    disc = (dx > 0.3) | (dy > 0.3)
+    return binary_dilation(disc, iterations=dilate) if dilate > 0 else disc
 
 
 def _ue_cam_to_world(pitch_deg, yaw_deg, roll_deg):
@@ -356,8 +393,13 @@ def _ue_cam_to_world(pitch_deg, yaw_deg, roll_deg):
     UE world: X=forward, Y=right, Z=up. Screen space: X=right, Y=down, Z=depth.
     Rotation order: Rz(yaw) @ Ry(pitch) @ Rx(roll)  (extrinsic Z->Y->X).
     Fill in pitch/yaw/roll from UE Details panel > Transform > Rotation.
+
+    Sign convention: UE positive-pitch = nose-up, but standard Ry(+θ) = nose-down,
+    so pitch is negated. Same logic applies to roll.
     """
-    p, y, r = np.radians(pitch_deg), np.radians(yaw_deg), np.radians(roll_deg)
+    p = -np.radians(pitch_deg)   # negate: UE +pitch = nose-up = standard Ry(-p)
+    y =  np.radians(yaw_deg)
+    r = -np.radians(roll_deg)    # negate: UE +roll = CW-fwd = standard Rx(-r)
     Rz = np.array([[ np.cos(y), -np.sin(y), 0],
                    [ np.sin(y),  np.cos(y), 0],
                    [0, 0, 1]], dtype=float)
@@ -380,8 +422,12 @@ _SNA_NAN = dict(sna_mean=float('nan'), sna_median=float('nan'),
 
 
 def compute_sna(depth_pred, gt_normals_world, mask, fx, fy, cx, cy, R_cam_to_world):
-    """Surface Normal Alignment vs UE WorldNormal EXR (degrees + threshold %)."""
-    valid = mask & np.isfinite(depth_pred) & (depth_pred > 0.1)
+    """Surface Normal Alignment vs UE WorldNormal EXR (degrees + threshold %).
+    Depth discontinuities are excluded from the mask — finite-diff normals at
+    edges are unreliable and would inflate the reported SNA values.
+    """
+    disc  = _disc_mask(depth_pred)
+    valid = mask & ~disc & np.isfinite(depth_pred) & (depth_pred > 0.1)
     if valid.sum() == 0:
         return _SNA_NAN.copy()
     n_cam   = _normals_from_depth(depth_pred, fx, fy, cx, cy)
@@ -489,6 +535,7 @@ def main():
     model_name     = AVAILABLE_MODELS[model_key]
     scaling_method = args.scaling
     scaling_folder = ('guided_completion' if model_key == 'marigold_dc'
+                      else 'depthlab'       if model_key == 'depthlab'
                       else ('median' if scaling_method == 'median' else 'least_squares'))
     dataset        = args.dataset
     input_folder   = os.path.join(PROJECT_ROOT, "data", dataset)
@@ -510,7 +557,17 @@ def main():
 
     target_shape = depth_gt_orig.shape
     H_gt, W_gt   = target_shape
-    _fx = (W_gt / 2.0) / np.tan(np.radians(90.0) / 2.0)
+
+    # ── Load camera params ───────────────────────────────────────────────────
+    cam_params_path = os.path.join(input_folder, "camera_params.json")
+    cp = {}
+    if os.path.exists(cam_params_path):
+        with open(cam_params_path) as f:
+            cp = json.load(f)
+    _fov = cp.get('fov_deg') or 90.0
+    if cp.get('fov_deg') is None:
+        print(f"  [warn] fov_deg not set in camera_params.json — assuming {_fov}°")
+    _fx = (W_gt / 2.0) / np.tan(np.radians(_fov) / 2.0)
     _fy, _cx, _cy = _fx, W_gt / 2.0, H_gt / 2.0
 
     # ── GT change mask ───────────────────────────────────────────────────────
@@ -518,30 +575,25 @@ def main():
     gt_changed   = np.abs(depth_diff) > args.change_threshold
     gt_unchanged = ~gt_changed
 
-    # Save GT mask visual check (skip if already saved by a previous model in --all-models)
     mask_png_path = os.path.join(output_subfolder, f"gt_mask_{dataset}.png")
-    if not os.path.exists(mask_png_path):
-        save_gt_mask_png(original_img, edited_img, depth_gt_orig, depth_gt_edit,
-                         gt_changed, depth_diff, args.change_threshold, mask_png_path)
+    save_gt_mask_png(original_img, edited_img, depth_gt_orig, depth_gt_edit,
+                     gt_changed, depth_diff, args.change_threshold, mask_png_path)
 
-    # ── Load camera params + WorldNormal for SNA ─────────────────────────────
-    cam_params_path = os.path.join(input_folder, "camera_params.json")
+    # ── Load WorldNormal for SNA ─────────────────────────────────────────────
     sna_ready = False
     R_cam_to_world = gt_normals_edit = None
-    if os.path.exists(cam_params_path):
-        with open(cam_params_path) as f:
-            cp = json.load(f)
-        if None not in (cp.get('pitch_deg'), cp.get('yaw_deg'), cp.get('roll_deg')):
-            R_cam_to_world = _ue_cam_to_world(cp['pitch_deg'], cp['yaw_deg'], cp['roll_deg'])
-            wn_edit = gt_edit_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
-            if os.path.exists(wn_edit):
-                gt_normals_edit = _load_world_normal(wn_edit)
-                sna_ready = True
+    if None not in (cp.get('pitch_deg'), cp.get('yaw_deg'), cp.get('roll_deg')):
+        R_cam_to_world = _ue_cam_to_world(cp['pitch_deg'], cp['yaw_deg'], cp['roll_deg'])
+        wn_edit = gt_edit_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
+        if os.path.exists(wn_edit):
+            gt_normals_edit = _load_world_normal(wn_edit)
+            sna_ready = True
 
-    # ── Build Marigold-DC sparse guidance from unchanged GT pixels ───────────
+    # ── Build sparse guidance from unchanged GT pixels (Marigold-DC + DepthLab) ─
     sparse_guidance, valid_guidance_mask = build_sparse_guidance(depth_gt_edit, gt_unchanged)
-    if model_key == 'marigold_dc' and valid_guidance_mask.sum() == 0:
-        raise ValueError("No valid unchanged GT pixels for Marigold-DC guidance")
+    guided_models = {'marigold_dc', 'depthlab'}
+    if model_key in guided_models and valid_guidance_mask.sum() == 0:
+        raise ValueError(f"No valid unchanged GT pixels for {model_name} guidance")
 
     # ── Run model on EDITED image only ──────────────────────────────────────
 
@@ -550,6 +602,7 @@ def main():
 
     sparse_guidance_path = None
     marigold_image_path  = None
+    depthlab_mask_path   = None
     try:
         if model_key == 'marigold_dc':
             mar_h, mar_w = get_processing_shape(target_shape[0], target_shape[1], MARIGOLD_MAX_RESOLUTION)
@@ -569,11 +622,40 @@ def main():
                 model_key, marigold_image_path, output_edited,
                 sparse_depth_path=sparse_guidance_path,
             )
+
+        elif model_key == 'depthlab':
+            dl_h, dl_w = get_processing_shape(target_shape[0], target_shape[1], DEPTHLAB_MAX_RESOLUTION)
+            dl_guidance = sparse_guidance
+            dl_mask     = gt_changed.astype(np.float32)   # 1=predict, 0=known
+            if (dl_h, dl_w) != target_shape:
+                dl_guidance = np.array(
+                    Image.fromarray(sparse_guidance).resize((dl_w, dl_h), Image.NEAREST),
+                    dtype=np.float32,
+                )
+                dl_mask = np.array(
+                    Image.fromarray(dl_mask).resize((dl_w, dl_h), Image.NEAREST),
+                    dtype=np.float32,
+                )
+            with tempfile.NamedTemporaryFile(suffix='.npy', delete=False) as f:
+                sparse_guidance_path = f.name
+            np.save(sparse_guidance_path, dl_guidance)
+            with tempfile.NamedTemporaryFile(suffix='.npy', delete=False) as f:
+                depthlab_mask_path = f.name
+            np.save(depthlab_mask_path, dl_mask)
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as f:
+                marigold_image_path = f.name
+            edited_img.resize((dl_w, dl_h), Image.BILINEAR).save(marigold_image_path)
+            run_model_subprocess(
+                model_key, marigold_image_path, output_edited,
+                sparse_depth_path=sparse_guidance_path,
+                mask_path=depthlab_mask_path,
+            )
+
         else:
             run_model_subprocess(model_key, edited_path, output_edited)
         depth_edited = np.load(output_edited)
     finally:
-        for p in [output_edited, sparse_guidance_path, marigold_image_path]:
+        for p in [output_edited, sparse_guidance_path, marigold_image_path, depthlab_mask_path]:
             if p and os.path.exists(p):
                 os.remove(p)
 
@@ -588,10 +670,10 @@ def main():
         edited_img = edited_img.resize(original_img.size, Image.BILINEAR)
 
     # ── Scale fit on unchanged pixels vs depth_gt_edit ───────────────────────
-    if model_key == 'marigold_dc':
+    if model_key in {'marigold_dc', 'depthlab'}:
         scale, shift = 1.0, 0.0
         depth_scaled = depth_edited.copy()
-        print("(Marigold-DC: no scale fit — guided completion)")
+        print(f"({model_name}: no scale fit — guided completion)")
     else:
         valid_fit = (
             gt_unchanged
@@ -626,7 +708,7 @@ def main():
     print("\n" + "=" * 75)
     print("METRICS")
     print("=" * 75)
-    print(f"{'Region':<22} {'n':>8} {'MAE (m)':>10} {'RMSE (m)':>10} {'δ1':>8} {'δ2':>8} {'δ3':>8} {'SNA(°)':>8}")
+    print(f"{'Region':<22} {'n':>8} {'MAE (m)':>10} {'RMSE (m)':>10} {'d1':>8} {'d2':>8} {'d3':>8} {'SNA(deg)':>8}")
     print("-" * 75)
     for label, m, sna in [("edit vs GT_edit (unch)", unch_m, sna_unch), ("edit vs GT_edit (chng)", ch_m, sna_ch)]:
         print(f"{label:<22} {m['n']:>8,} {m['mae']:>10.4f} {m['rmse']:>10.4f} "
@@ -642,7 +724,7 @@ def main():
         'edit_unchanged': {**unch_m, **sna_unch},
         'edit_changed':   {**ch_m,   **sna_ch},
     }
-    if model_key == 'marigold_dc':
+    if model_key in {'marigold_dc', 'depthlab'}:
         metrics_entry['guidance_pixels'] = int(valid_guidance_mask.sum())
 
     metrics_path = os.path.join(output_subfolder, "metrics_data.json")
@@ -684,7 +766,9 @@ def main():
     axes[0, 3].axis('off')
 
     # Row 1: Pred scaled, full error, error unchanged, error changed
-    suffix = 'Dense (Marigold)' if model_key == 'marigold_dc' else 'Scaled (unch fit)'
+    suffix = ('Dense (Marigold)'  if model_key == 'marigold_dc'
+              else 'Dense (DepthLab)' if model_key == 'depthlab'
+              else 'Scaled (unch fit)')
     im = axes[1, 0].imshow(depth_scaled, cmap='turbo', vmin=vmin_d, vmax=vmax_d)
     axes[1, 0].set_title(f'{model_name}\n({suffix})', fontsize=11); axes[1, 0].axis('off')
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04, label='m')

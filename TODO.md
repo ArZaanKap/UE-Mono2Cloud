@@ -42,24 +42,6 @@ The literature frames our problem as **"depth completion with partial GT"** rath
 
 ---
 
-## Priority 3 — Better change detection = better calibration anchor
-
-Even with current least-squares approach, more accurate unchanged-pixel masks give the calibration more signal. GeSCF is already best; consider:
-- Tuning GeSCF adaptive threshold per dataset
-- Ensembling GeSCF + DINOv2 masks (union of confident unchanged regions)
-
----
-
-## Housekeeping (carry-over, not done yet)
-
-- Delete: `data/depth5/`, `data/mrq2/` (unused datasets)
-- Delete: `main.txt`, `data_analysis_report.txt` (old notes, superseded by `.md` versions)
-- Point-cloud outputs have been reorganized under `MAIN_TEST/` with model-specific folders (`pointclouds_depth_pro/`, `pointclouds_da3/`, `pointclouds_marigold/`)
-- `compare_edit_depth` scripts: add `--mask-path` arg so they aren't hard-coded to `.npy` files (Option B)
-- Compare Marigold point clouds qualitatively against Depth Pro / DA3 on inserted objects, not just unchanged-region metrics
-
----
-
 ## What we already ruled out
 
 | Method | Why not |

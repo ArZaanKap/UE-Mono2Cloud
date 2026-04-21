@@ -53,7 +53,7 @@ OUTPUT_FOLDER  = os.path.join(SCRIPT_DIR, "v1")
 GT_TO_CENTIMETERS        = 10000.0
 DEFAULT_CHANGE_THRESHOLD = 0.0   # metres
 
-AVAILABLE_DATASETS = ['new0', 'new1', 'new2', 'new3']
+AVAILABLE_DATASETS = ['new0', 'new1', 'new2', 'new3', 'new4']
 DEFAULT_DATASET          = 'new0'
 
 AVAILABLE_MODELS = {
@@ -203,7 +203,7 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 torch.set_grad_enabled(False)
 {exr_loader}
-da3_src = Path(r"{PROJECT_ROOT}") / "Depth-Anything-3" / "src"
+da3_src = Path(r"{PROJECT_ROOT}") / "depth_models" / "Depth-Anything-3" / "src"
 if da3_src.exists() and str(da3_src) not in sys.path:
     sys.path.insert(0, str(da3_src))
 from depth_anything_3.api import DepthAnything3
@@ -231,7 +231,7 @@ print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}
 '''
 
     elif model_name == 'dpro':
-        depth_pro_checkpoint = os.path.join(PROJECT_ROOT, "checkpoints", "depth_pro.pt").replace('\\', '/')
+        depth_pro_checkpoint = os.path.join(PROJECT_ROOT, "depth_models", "checkpoints", "depth_pro.pt").replace('\\', '/')
         script = f'''
 import torch
 import numpy as np
@@ -305,7 +305,7 @@ def _load_world_normal(path):
         buf = exr_file.channel(c, FLOAT)
         ch.append(np.frombuffer(buf, dtype=np.float32).reshape(height, width).copy())
     raw = np.stack(ch, axis=-1)
-    N   = raw / np.pi - 1.0
+    N   = raw - 1.0   # UE stores world normals as N+1 in [0,2]; decode: raw-1
     return N / (np.linalg.norm(N, axis=-1, keepdims=True) + 1e-6)
 
 
@@ -315,10 +315,19 @@ def _normals_from_depth(depth_m, fx, fy, cx, cy):
     pts = np.stack([(uu - cx) * depth_m / fx,
                     (vv - cy) * depth_m / fy,
                     depth_m.copy()], axis=-1)
-    dx = np.roll(pts, -1, axis=1) - np.roll(pts, 1, axis=1)
-    dy = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
-    n  = np.cross(dx, dy)
+    # np.gradient handles image boundaries correctly (no wrap-around artefacts)
+    dy, dx = np.gradient(pts, axis=(0, 1))
+    n = np.cross(dx, dy)
     return -n / (np.linalg.norm(n, axis=-1, keepdims=True) + 1e-6)
+
+
+def _disc_mask(depth_m, dilate=3):
+    """Pixels at depth discontinuities where finite-diff normals are unreliable."""
+    dx = np.abs(np.roll(depth_m, -1, axis=1) - np.roll(depth_m, 1, axis=1))
+    dy = np.abs(np.roll(depth_m, -1, axis=0) - np.roll(depth_m, 1, axis=0))
+    from scipy.ndimage import binary_dilation
+    disc = (dx > 0.3) | (dy > 0.3)
+    return binary_dilation(disc, iterations=dilate) if dilate > 0 else disc
 
 
 def _ue_cam_to_world(pitch_deg, yaw_deg, roll_deg):
@@ -327,8 +336,13 @@ def _ue_cam_to_world(pitch_deg, yaw_deg, roll_deg):
     UE world: X=forward, Y=right, Z=up. Screen space: X=right, Y=down, Z=depth.
     Rotation order: Rz(yaw) @ Ry(pitch) @ Rx(roll)  (extrinsic Z->Y->X).
     Fill in pitch/yaw/roll from UE Details panel > Transform > Rotation.
+
+    Sign convention: UE positive-pitch = nose-up, but standard Ry(+θ) = nose-down,
+    so pitch is negated. Same logic applies to roll.
     """
-    p, y, r = np.radians(pitch_deg), np.radians(yaw_deg), np.radians(roll_deg)
+    p = -np.radians(pitch_deg)   # negate: UE +pitch = nose-up = standard Ry(-p)
+    y =  np.radians(yaw_deg)
+    r = -np.radians(roll_deg)    # negate: UE +roll = CW-fwd = standard Rx(-r)
     Rz = np.array([[ np.cos(y), -np.sin(y), 0],
                    [ np.sin(y),  np.cos(y), 0],
                    [0, 0, 1]], dtype=float)
@@ -351,8 +365,12 @@ _SNA_NAN = dict(sna_mean=float('nan'), sna_median=float('nan'),
 
 
 def compute_sna(depth_pred, gt_normals_world, mask, fx, fy, cx, cy, R_cam_to_world):
-    """Surface Normal Alignment vs UE WorldNormal EXR (degrees + threshold %)."""
-    valid = mask & np.isfinite(depth_pred) & (depth_pred > 0.1)
+    """Surface Normal Alignment vs UE WorldNormal EXR (degrees + threshold %).
+    Depth discontinuities are excluded from the mask — finite-diff normals at
+    edges are unreliable and would inflate the reported SNA values.
+    """
+    disc  = _disc_mask(depth_pred)
+    valid = mask & ~disc & np.isfinite(depth_pred) & (depth_pred > 0.1)
     if valid.sum() == 0:
         return _SNA_NAN.copy()
     n_cam   = _normals_from_depth(depth_pred, fx, fy, cx, cy)
@@ -465,7 +483,17 @@ def main():
 
     target_shape = depth_gt_orig.shape
     H_gt, W_gt   = target_shape
-    _fx = (W_gt / 2.0) / np.tan(np.radians(90.0) / 2.0)
+
+    # ── Load camera params ───────────────────────────────────────────────────
+    cam_params_path = os.path.join(input_folder, "camera_params.json")
+    cp = {}
+    if os.path.exists(cam_params_path):
+        with open(cam_params_path) as f:
+            cp = json.load(f)
+    _fov = cp.get('fov_deg') or 90.0
+    if cp.get('fov_deg') is None:
+        print(f"  [warn] fov_deg not set in camera_params.json — assuming {_fov}°")
+    _fx = (W_gt / 2.0) / np.tan(np.radians(_fov) / 2.0)
     _fy, _cx, _cy = _fx, W_gt / 2.0, H_gt / 2.0
 
     # ── GT change mask ───────────────────────────────────────────────────────
@@ -473,27 +501,21 @@ def main():
     gt_changed   = np.abs(depth_diff) > args.change_threshold
     gt_unchanged = ~gt_changed
 
-    # Save GT mask visual check (skip if already saved by a previous model in --all-models)
     mask_png_path = os.path.join(output_subfolder, f"gt_mask_{dataset}.png")
-    if not os.path.exists(mask_png_path):
-        save_gt_mask_png(original_img, edited_img, depth_gt_orig, depth_gt_edit,
-                         gt_changed, depth_diff, args.change_threshold, mask_png_path)
+    save_gt_mask_png(original_img, edited_img, depth_gt_orig, depth_gt_edit,
+                     gt_changed, depth_diff, args.change_threshold, mask_png_path)
 
-    # ── Load camera params + WorldNormals for SNA ────────────────────────────
-    cam_params_path = os.path.join(input_folder, "camera_params.json")
+    # ── Load WorldNormals for SNA ────────────────────────────────────────────
     sna_ready = False
     R_cam_to_world = gt_normals_orig = gt_normals_edit = None
-    if os.path.exists(cam_params_path):
-        with open(cam_params_path) as f:
-            cp = json.load(f)
-        if None not in (cp.get('pitch_deg'), cp.get('yaw_deg'), cp.get('roll_deg')):
-            R_cam_to_world = _ue_cam_to_world(cp['pitch_deg'], cp['yaw_deg'], cp['roll_deg'])
-            wn_orig = gt_orig_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
-            wn_edit = gt_edit_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
-            if os.path.exists(wn_edit):
-                gt_normals_edit = _load_world_normal(wn_edit)
-                sna_ready = True
-            if os.path.exists(wn_orig):
+    if None not in (cp.get('pitch_deg'), cp.get('yaw_deg'), cp.get('roll_deg')):
+        R_cam_to_world = _ue_cam_to_world(cp['pitch_deg'], cp['yaw_deg'], cp['roll_deg'])
+        wn_orig = gt_orig_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
+        wn_edit = gt_edit_path.replace('_SceneDepth.exr', '_WorldNormal.exr')
+        if os.path.exists(wn_edit):
+            gt_normals_edit = _load_world_normal(wn_edit)
+            sna_ready = True
+        if os.path.exists(wn_orig):
                 gt_normals_orig = _load_world_normal(wn_orig)
 
     # ── Run model on both images ────────────────────────────────────────────

@@ -13,9 +13,18 @@ Usage:
     python change_detection_results/test_change_detection.py --dataset depth4 --skip-dino --skip-crossattn
 """
 
-import os, sys, glob, argparse, json
+import os, sys, glob, argparse, json, warnings
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+warnings.filterwarnings("ignore", message=".*use_fast.*")
+warnings.filterwarnings("ignore", message=".*grid_sample.*")
+warnings.filterwarnings("ignore", message=".*Xet Storage.*")
+warnings.filterwarnings("ignore", message=".*timm.models.layers.*")
+warnings.filterwarnings("ignore", category=FutureWarning)
 import numpy as np
 from PIL import Image
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -25,12 +34,13 @@ SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 sys.path.insert(0, SCRIPT_DIR)
 
-from params import DINO_BASELINE, GESCF_BASELINE, RGB_BASELINE, CROSSATTN_BASELINE
+from params import (DINO_BASELINE, DINOV3_BASELINE, GESCF_BASELINE, RGB_BASELINE,
+                    CROSSATTN_BASELINE, VIEWDELTA_BASELINE, OFFICIAL_GESCF_BASELINE)
 
 DEFAULT_DATASET          = "new3"
-DEFAULT_CHANGE_THRESHOLD = 0.00   # metres — for GT mask derivation from depth diff
+DEFAULT_CHANGE_THRESHOLD = 0.0   # metres — for GT mask derivation from depth diff
 
-AVAILABLE_DATASETS = ['depth4', 'concrete1', 'test2', 'new0', 'new1']
+AVAILABLE_DATASETS = ['depth4', 'concrete1', 'test2', 'new0', 'new1', 'new2', 'new2_2', 'new3', 'new4']
 
 
 # ---------------------------------------------------------------------------
@@ -164,14 +174,47 @@ def dinov2_feature_mask(img1, img2,
     from transformers import AutoImageProcessor, AutoModel
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"  Loading DINOv2 ({model_name}) on {device} ...")
-    processor = AutoImageProcessor.from_pretrained(
-        model_name,
-        size={"height": 518, "width": 518},
-        crop_size={"height": 518, "width": 518},
-    )
-    model = AutoModel.from_pretrained(model_name).to(device).eval()
-    num_register = 4 if "reg" in model_name else 0
+    family = "DINOv3" if "dinov3" in model_name.lower() else "DINOv2"
+    print(f"  Loading {family} ({model_name}) on {device} ...")
+    try:
+        processor = AutoImageProcessor.from_pretrained(
+            model_name,
+            local_files_only=True,
+            size={"height": 518, "width": 518},
+            crop_size={"height": 518, "width": 518},
+        )
+    except Exception:
+        try:
+            processor = AutoImageProcessor.from_pretrained(
+                model_name,
+                size={"height": 518, "width": 518},
+                crop_size={"height": 518, "width": 518},
+            )
+        except Exception as first_error:
+            # Older DINO checkpoints can share the DINOv2 preprocessing.
+            print("  (no registered processor — falling back to dinov2-base preprocessor)")
+            try:
+                processor = AutoImageProcessor.from_pretrained(
+                    "facebook/dinov2-base",
+                    local_files_only=True,
+                    size={"height": 518, "width": 518},
+                    crop_size={"height": 518, "width": 518},
+                )
+            except Exception as fallback_error:
+                try:
+                    processor = AutoImageProcessor.from_pretrained(
+                        "facebook/dinov2-base",
+                        size={"height": 518, "width": 518},
+                        crop_size={"height": 518, "width": 518},
+                    )
+                except Exception:
+                    raise first_error from fallback_error
+
+    try:
+        model = AutoModel.from_pretrained(model_name, local_files_only=True).to(device).eval()
+    except Exception:
+        model = AutoModel.from_pretrained(model_name).to(device).eval()
+    num_register = int(getattr(model.config, "num_register_tokens", 0) or 0)
 
     with torch.no_grad():
         inp1 = processor(images=img1, return_tensors="pt").to(device)
@@ -208,7 +251,7 @@ def gescf_feature_mask(img1, img2,
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    weights_dir  = os.path.join(PROJECT_ROOT, "weights")
+    weights_dir  = os.path.join(PROJECT_ROOT, "mask_models", "weights")
     os.makedirs(weights_dir, exist_ok=True)
     weights_path = os.path.join(weights_dir, "sam_vit_b_01ec64.pth")
     if not os.path.exists(weights_path):
@@ -347,6 +390,172 @@ def dino_crossattn_mask(img1, img2, threshold=0.5, pretrained="dino_2Cross_PSCD"
     return mask_full, prob_full
 
 
+def official_gescf_mask(img_t0_path, img_t1_path,
+                        output_size=OFFICIAL_GESCF_BASELINE['output_size'],
+                        feature_facet=OFFICIAL_GESCF_BASELINE['feature_facet'],
+                        feature_layer=OFFICIAL_GESCF_BASELINE['feature_layer'],
+                        embedding_layer=OFFICIAL_GESCF_BASELINE['embedding_layer'],
+                        points_per_side=OFFICIAL_GESCF_BASELINE['points_per_side'],
+                        pred_iou_thresh=OFFICIAL_GESCF_BASELINE['pred_iou_thresh'],
+                        stability_score_thresh=OFFICIAL_GESCF_BASELINE['stability_score_thresh']):
+    """Official GeSCF (CVPR 2025) — SAM ViT-H + SuperPoint coarse alignment + geometric-semantic mask matching."""
+    import argparse
+
+    gescf_src = os.path.join(PROJECT_ROOT, "mask_models", "gescf-official", "src")
+    if gescf_src not in sys.path:
+        sys.path.insert(0, gescf_src)
+
+    try:
+        from framework import GeSCF
+    except ImportError as e:
+        raise ImportError(
+            f"Official GeSCF not found. Expected at {gescf_src}\n"
+            "  git clone https://github.com/1124jaewookim/towards-generalizable-scene-change-detection.git gescf-official"
+        ) from e
+
+    weights_dir = os.path.join(gescf_src, "pretrained_weight")
+    os.makedirs(weights_dir, exist_ok=True)
+
+    sam_path = os.path.join(weights_dir, "sam_vit_h_4b8939.pth")
+    if not os.path.exists(sam_path):
+        print("  Downloading SAM ViT-H (~2.5 GB) ...")
+        import urllib.request
+        urllib.request.urlretrieve(
+            "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth", sam_path
+        )
+
+    sp_path = os.path.join(weights_dir, "superpoint_v1.pth")
+    if not os.path.exists(sp_path):
+        print("  Downloading SuperPoint weights (~5 MB) ...")
+        import urllib.request
+        urllib.request.urlretrieve(
+            "https://github.com/magicleap/SuperPointPretrainedNetwork/raw/master/superpoint_v1.pth",
+            sp_path,
+        )
+
+    args = argparse.Namespace(
+        test_dataset='Random',
+        output_size=output_size,
+        img_t0_path=img_t0_path,
+        img_t1_path=img_t1_path,
+        gt_path=None,
+        feature_facet=feature_facet,
+        feature_layer=feature_layer,
+        embedding_layer=embedding_layer,
+        sam_backbone='vit_h',
+        pseudo_backbone='vit_h',
+        points_per_side=points_per_side,
+        pred_iou_thresh=pred_iou_thresh,
+        stability_score_thresh=stability_score_thresh,
+    )
+
+    # framework.py uses CWD-relative paths — chdir to src/ for the duration of inference
+    old_cwd = os.getcwd()
+    os.chdir(gescf_src)
+    try:
+        model = GeSCF(args)
+        mask_out = model(img_t0_path, img_t1_path)   # (output_size, output_size) uint8 0/1
+    finally:
+        os.chdir(old_cwd)
+
+    # Resize to original image resolution
+    orig = np.array(Image.open(img_t0_path))
+    h, w = orig.shape[:2]
+    mask_full = np.array(
+        Image.fromarray(mask_out.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)
+    ) > 127
+
+    # GeSCF has no probability map — use the binary mask as float diff_map
+    diff_map = mask_full.astype(np.float32)
+    return mask_full, diff_map
+
+
+def viewdelta_mask(img1, img2,
+                   text_prompt=VIEWDELTA_BASELINE['text_prompt'],
+                   threshold=VIEWDELTA_BASELINE['threshold']):
+    """ViewDelta text-conditioned scene change detection (ICCV 2025)."""
+    viewdelta_dir = os.path.join(PROJECT_ROOT, "mask_models", "viewdelta-scd")
+    if viewdelta_dir not in sys.path:
+        sys.path.insert(0, viewdelta_dir)
+    try:
+        from ViewDelta.model.transformer_args import TransformerModelArgs
+        from ViewDelta.embedders import get_embedders, get_model_features_from_image
+        from ViewDelta.model.model_feature_segmentor import TextConditionedDecoder
+    except ImportError as e:
+        raise ImportError(
+            "ViewDelta not found. Clone the repo:\n"
+            f"  git clone https://github.com/drags99/viewdelta-scd.git {viewdelta_dir}\n"
+            "  pip install einops kornia lightning timm"
+        ) from e
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    weights_dir      = os.path.join(PROJECT_ROOT, "mask_models", "weights")
+    checkpoint_path  = os.path.join(weights_dir, "viewdelta_checkpoint.pth")
+    if not os.path.exists(checkpoint_path):
+        print("  Downloading ViewDelta checkpoint (~201 MB) ...")
+        import urllib.request
+        os.makedirs(weights_dir, exist_ok=True)
+        urllib.request.urlretrieve(
+            "https://huggingface.co/hoskerelab/ViewDelta/resolve/main/viewdelta_checkpoint.pth",
+            checkpoint_path,
+        )
+
+    model_args = TransformerModelArgs(
+        text_embeddings="siglip",
+        image_embeddings="dinov2",
+        use_multiscale=False,
+        use_separation_tokens=False,
+        depth=12, dim=768, mlp_dim=3072, heads=12,
+        checkpoint_attn=False, checkpoint_ff=False,
+    )
+    model_args.text_tokens          = 64
+    model_args.text_embedding_dim   = 1024
+    model_args.img_tokens           = 257
+    model_args.image_embedding_dim  = 1024
+
+    print(f"  Loading ViewDelta checkpoint ...")
+    model = TextConditionedDecoder(model_args).to(device).eval()
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    model.load_state_dict(state_dict)
+
+    print(f"  Loading embedders (DINOv2-large + SigLIP) ...")
+    emb = get_embedders(model_args)
+
+    h, w    = np.array(img1).shape[:2]
+    img1_s  = img1.resize((256, 256))
+    img2_s  = img2.resize((256, 256))
+
+    with torch.no_grad():
+        f1 = get_model_features_from_image(
+            img1_s, emb["image_model"], emb["image_processor"], model_args
+        ).to(device)
+        f2 = get_model_features_from_image(
+            img2_s, emb["image_model"], emb["image_processor"], model_args
+        ).to(device)
+
+        text_tokens = emb["text_processor"](
+            text=text_prompt, padding="max_length", return_tensors="pt"
+        )
+        # text_model stays on CPU — run there and move output to device afterwards
+        text_feats = emb["text_model"](**text_tokens)["last_hidden_state"].detach().to(device)
+
+        output      = model(f1, f2, text_feats)
+        prob_256    = torch.softmax(output, dim=1)[0, 1].cpu().numpy()
+        print(f"  prob_map range: {prob_256.min():.4f}–{prob_256.max():.4f}  "
+              f"mean={prob_256.mean():.4f}")
+        seg_256     = prob_256 > threshold
+
+    prob_full = np.array(
+        Image.fromarray((prob_256 * 255).astype(np.uint8)).resize((w, h), Image.BILINEAR)
+    ).astype(np.float32) / 255.0
+    mask_full = np.array(
+        Image.fromarray(seg_256.astype(np.uint8) * 255).resize((w, h), Image.NEAREST)
+    ) > 127
+
+    return mask_full, prob_full
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
@@ -398,7 +607,6 @@ def _save_method_png(original_img, edited_img, diff_map, mask, label, out_dir, d
     path  = os.path.join(out_dir, fname)
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
     return path
 
 
@@ -451,7 +659,6 @@ def _save_summary_png(original_img, edited_img, results, out_dir, dataset, gt_ch
     path = os.path.join(out_dir, f"summary_{dataset}.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print(f"  Saved: {path}")
 
 
 def _clean_old_outputs(out_dir, dataset):
@@ -483,9 +690,23 @@ def main():
     p.add_argument('--crossattn-threshold', type=float, default=CROSSATTN_BASELINE['threshold'])
     p.add_argument('--crossattn-model',     default=CROSSATTN_BASELINE['model'],
                    choices=['dino_2Cross_CMU', 'dino_2Cross_PSCD', 'dino_2Cross_DiffCMU'])
-    p.add_argument('--skip-dino',      action='store_true')
-    p.add_argument('--skip-gescf',     action='store_true')
-    p.add_argument('--skip-crossattn', action='store_true')
+    p.add_argument('--dinov3-threshold', type=float, default=DINOV3_BASELINE['threshold'])
+    p.add_argument('--dinov3-sigma',     type=int,   default=DINOV3_BASELINE['sigma'])
+    p.add_argument('--dinov3-min-area',  type=int,   default=DINOV3_BASELINE['min_area'])
+    p.add_argument('--dinov3-dilate',    type=int,   default=DINOV3_BASELINE['dilate_iter'])
+    p.add_argument('--ogescf-points',     type=int,   default=OFFICIAL_GESCF_BASELINE['points_per_side'])
+    p.add_argument('--ogescf-iou',        type=float, default=OFFICIAL_GESCF_BASELINE['pred_iou_thresh'])
+    p.add_argument('--ogescf-stability',  type=float, default=OFFICIAL_GESCF_BASELINE['stability_score_thresh'])
+    p.add_argument('--skip-ogescf',       action='store_true')
+    p.add_argument('--viewdelta-prompt',    default=VIEWDELTA_BASELINE['text_prompt'],
+                   help='Text prompt for ViewDelta (e.g. "all changes", "object changes")')
+    p.add_argument('--viewdelta-threshold', type=float, default=VIEWDELTA_BASELINE['threshold'],
+                   help='Probability threshold for ViewDelta mask (default 0.15)')
+    p.add_argument('--skip-dino',        action='store_true')
+    p.add_argument('--skip-dinov3',      action='store_true')
+    p.add_argument('--skip-gescf',       action='store_true')
+    p.add_argument('--skip-crossattn',   action='store_true')
+    p.add_argument('--skip-viewdelta',   action='store_true')
     p.add_argument('--no-show',        action='store_true')
     # GT depth scoring (optional — enables per-method scoring vs ground truth)
     p.add_argument('--gt-depth-orig',    default=None,
@@ -575,7 +796,6 @@ def main():
     )
     print(f"  threshold={args.rgb_threshold}  changed={rgb_mask.mean()*100:.2f}%")
     results['RGB'] = {'mask': rgb_mask, 'diff_map': rgb_diff}
-    np.save(os.path.join(out_dir, f"rgb_{args.dataset}_mask.npy"), rgb_mask)
     _save_method_png(original_img, edited_img, rgb_diff, rgb_mask, "RGB", out_dir, args.dataset, vmax=80)
 
     # ── DINOv2 ───────────────────────────────────────────────────────────────
@@ -591,9 +811,27 @@ def main():
             )
             print(f"  threshold={args.dino_threshold}  sigma={args.dino_sigma}  changed={dino_mask.mean()*100:.2f}%")
             results['DINOv2'] = {'mask': dino_mask, 'diff_map': dino_diff}
-            np.save(os.path.join(out_dir, f"dinov2_{args.dataset}_mask.npy"), dino_mask)
             _save_method_png(original_img, edited_img, dino_diff, dino_mask,
                              "DINOv2", out_dir, args.dataset, vmax=0.5)
+        except Exception as e:
+            print(f"  ERROR: {e}")
+
+    # ── DINOv3 ───────────────────────────────────────────────────────────────
+    if not args.skip_dinov3:
+        print("\n--- DINOv3 ---")
+        try:
+            dv3_mask, dv3_diff = dinov2_feature_mask(
+                original_img, edited_img,
+                threshold=args.dinov3_threshold,
+                sigma=args.dinov3_sigma,
+                min_area=args.dinov3_min_area,
+                dilate_iter=args.dinov3_dilate,
+                model_name=DINOV3_BASELINE['model_name'],
+            )
+            print(f"  threshold={args.dinov3_threshold}  sigma={args.dinov3_sigma}  changed={dv3_mask.mean()*100:.2f}%")
+            results['DINOv3'] = {'mask': dv3_mask, 'diff_map': dv3_diff}
+            _save_method_png(original_img, edited_img, dv3_diff, dv3_mask,
+                             "DINOv3", out_dir, args.dataset, vmax=0.5)
         except Exception as e:
             print(f"  ERROR: {e}")
 
@@ -608,9 +846,41 @@ def main():
             )
             print(f"  changed={gescf_mask.mean()*100:.2f}%")
             results['GeSCF'] = {'mask': gescf_mask, 'diff_map': gescf_diff}
-            np.save(os.path.join(out_dir, f"gescf_{args.dataset}_mask.npy"), gescf_mask)
             _save_method_png(original_img, edited_img, gescf_diff, gescf_mask,
                              "GeSCF", out_dir, args.dataset, vmax=1.0)
+        except Exception as e:
+            print(f"  SKIPPED: {e}")
+
+    # ── Official GeSCF ───────────────────────────────────────────────────────
+    if not args.skip_ogescf:
+        print("\n--- Official GeSCF (ViT-H, layer 17/32) ---")
+        try:
+            og_mask, og_diff = official_gescf_mask(
+                original_path, edited_path,
+                points_per_side=args.ogescf_points,
+                pred_iou_thresh=args.ogescf_iou,
+                stability_score_thresh=args.ogescf_stability,
+            )
+            print(f"  changed={og_mask.mean()*100:.2f}%")
+            results['OfficialGeSCF'] = {'mask': og_mask, 'diff_map': og_diff}
+            _save_method_png(original_img, edited_img, og_diff, og_mask,
+                             "Official GeSCF", out_dir, args.dataset, vmax=1.0)
+        except Exception as e:
+            print(f"  SKIPPED: {e}")
+
+    # ── ViewDelta ─────────────────────────────────────────────────────────────
+    if not args.skip_viewdelta:
+        print(f"\n--- ViewDelta (prompt: '{args.viewdelta_prompt}') ---")
+        try:
+            vd_mask, vd_prob = viewdelta_mask(
+                original_img, edited_img,
+                text_prompt=args.viewdelta_prompt,
+                threshold=args.viewdelta_threshold,
+            )
+            print(f"  changed={vd_mask.mean()*100:.2f}%")
+            results['ViewDelta'] = {'mask': vd_mask, 'diff_map': vd_prob}
+            _save_method_png(original_img, edited_img, vd_prob, vd_mask,
+                             "ViewDelta", out_dir, args.dataset, vmax=1.0)
         except Exception as e:
             print(f"  SKIPPED: {e}")
 
@@ -625,23 +895,10 @@ def main():
             )
             print(f"  changed={ca_mask.mean()*100:.2f}%")
             results['CrossAttn'] = {'mask': ca_mask, 'diff_map': ca_prob}
-            np.save(os.path.join(out_dir, f"crossattn_{args.dataset}_mask.npy"), ca_mask)
             _save_method_png(original_img, edited_img, ca_prob, ca_mask,
                              "CrossAttn", out_dir, args.dataset, vmax=1.0)
         except Exception as e:
             print(f"  SKIPPED: {e}")
-
-    # ── Pairwise IoU summary ──────────────────────────────────────────────────
-    if len(results) > 1:
-        print("\n--- Pairwise IoU ---")
-        keys = list(results.keys())
-        for i in range(len(keys)):
-            for j in range(i + 1, len(keys)):
-                a, b = results[keys[i]]['mask'], results[keys[j]]['mask']
-                inter = np.logical_and(a, b).sum()
-                union = np.logical_or(a, b).sum()
-                iou   = inter / union if union > 0 else 0.0
-                print(f"  {keys[i]:>10} vs {keys[j]:<10}  IoU={iou:.3f}")
 
     # ── GT mask scoring (before summary so scores appear in image titles) ────────
     detection_scores = None
@@ -684,7 +941,6 @@ def main():
         scores_path = os.path.join(out_dir, "detection_scores.json")
         with open(scores_path, 'w') as f:
             json.dump(detection_scores, f, indent=2)
-        print(f"\nScores saved: {scores_path}")
 
     print("\nDone.")
 

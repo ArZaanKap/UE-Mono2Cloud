@@ -21,7 +21,8 @@ OpenEXR
 laspy
 pandas
 plotly
-transformers
+transformers>=5.5.4,<6
+diffusers>=0.37.1,<0.38
 huggingface_hub
 depth-pro==0.1
 segment-anything
