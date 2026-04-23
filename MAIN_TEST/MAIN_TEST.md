@@ -7,9 +7,9 @@ The two main notebooks take a UE render + edited image and produce a coloured `.
 | `MAIN_TEST/img_to_pointcloud_depth_pro.ipynb` | Depth Pro | `MAIN_TEST/pointclouds_depth_pro/` |
 | `MAIN_TEST/img_to_pointcloud_depth_pro_legacy.ipynb` | Depth Pro (legacy variant) | `MAIN_TEST/pointclouds_depth_pro_legacy/` |
 | `MAIN_TEST/img_to_pointcloud_da3.ipynb` | Depth Anything 3 (DA3 Giant / DA3 Nested) | `MAIN_TEST/pointclouds_da3/` |
-| `MAIN_TEST/img_to_pointcloud_marigold.py` | Marigold-DC | `MAIN_TEST/pointclouds_marigold/` |
+| `MAIN_TEST/img_to_pointcloud_marigold.ipynb` | Marigold-DC | `MAIN_TEST/pointclouds_marigold/` |
 
-Both follow the same pipeline. Depth Pro currently gives better results (lower RMSE). DA3 is the newer alternative.
+Both follow the same pipeline. Depth Pro currently gives better results (lower RMSE) on changed regions. DA3 is the newer alternative.
 
 ---
 

@@ -1,36 +1,21 @@
 # TODO — Next Steps
 
-Best monocular baseline: **Depth Pro + GeSCF mask + least-squares → MAE 4.2cm, RMSE 6.5cm** (`data/depth4`)
+**Current benchmark datasets:** `new0`–`new4` — UE-rendered pairs with GT depth for both original and edit. Results in `compare_edit_depth/v2/`.
 
-Best sparse-guided result so far: **Marigold-DC + GeSCF sparse UE guide → MAE ~1.6–1.7cm, RMSE ~3.7–4.1cm** on unchanged regions (`data/depth4`).
-Important caveat: those unchanged pixels are also the guidance signal, so this is not a like-for-like comparison with monocular + least-squares.
+**Best on changed regions (v2 benchmark):** **Depth Pro + least-squares** — consistently lowest MAE across most datasets (6.9–25.0 cm depending on scene).
+
+**Best on unchanged regions:** DA3 Giant / DA3 Nested — lower MAE than Depth Pro on calibrated pixels.
+
+**DepthLab finding:** MAE ~1–3 cm on unchanged (best of all models), but MAE ~75–128 cm on changed — it propagates wrong depth to pixels without guidance rather than generating new geometry for new objects. Not suitable as-is for our use case.
 
 ---
 
-## Priority 1 — Replace calibration step with diffusion-based depth completion
+## Priority 1 — Depth Anything with Any Prior ← main next model
 
-The literature frames our problem as **"depth completion with partial GT"** rather than monocular depth + post-hoc scale/shift. The edited pixels have no GT anchor; diffusion-based models can propagate geometry from surrounding known-depth pixels in a structure-preserving way that least-squares cannot.
-
-### Marigold-DC ← tried
-- **Paper:** arxiv:2412.13389 (ICCV 2025)
-- **Code:** https://github.com/prs-eth/Marigold-DC
-- **What it does:** Diffusion depth completion with sparse GT as test-time guidance. Input: RGB + sparse known depths. Output: dense metric depth consistent with known regions.
-- **How to plug in:** Feed unchanged-pixel GT depths (from UE) as sparse guide + edited RGB image → get dense depth for all pixels. Replaces steps 4–5 of current pipeline entirely.
-- **No retraining needed — zero-shot.**
-- **Status:** Integrated into `compare_edit_depth/compare_edit_depth2.py` as `--model marigold_dc` and added end-to-end pipeline `MAIN_TEST/img_to_pointcloud_marigold.py`.
-- **Bring-up notes:** Needed RGB-only input, matched RGB/depth guide sizes, and a 768px long-edge cap on this 8 GB GPU.
-- **Next check:** visually review changed regions / point clouds and try ablations (`native`, `scale-only`, `scale+shift`) if we want to test whether any post-fit helps.
-
-### DepthLab ← try second
-- **Paper:** arxiv:2412.18153
-- **Site:** https://johanan528.github.io/depthlab_web/
-- **What it does:** Dual-branch diffusion — one branch reads RGB, one reads the known-depth region. Trained on Hypersim (synthetic indoor, close to UE renders).
-- **Same drop-in role as Marigold-DC.** Benchmark both.
-- **Now the main next model to test.**
-
-### Depth Anything with Any Prior ← try third
 - **Paper:** ICLR 2026 (OpenReview)
 - **What it does:** Conditional Depth Anything variant that accepts any partial depth prior at test time, scale-invariant log loss. Designed for exactly "I have some GT depth, fill in the rest".
+- Same drop-in role as Marigold-DC. The key difference from DepthLab: designed to generalise to pixels without guidance, not just propagate known values.
+- **Status:** Not yet tried.
 
 ---
 
@@ -39,6 +24,25 @@ The literature frames our problem as **"depth completion with partial GT"** rath
 - **Paper:** CVPR 2025
 - **What it does:** Integrates sparse depth (LiDAR in their case, UE GT in ours) at multiple scales into a DPT-based model to get metric output everywhere.
 - More involved integration than P1 methods but potentially higher accuracy.
+
+---
+
+## Already tried
+
+### Marigold-DC ← tried
+- **Paper:** arxiv:2412.13389 (ICCV 2025)
+- **Code:** https://github.com/prs-eth/Marigold-DC
+- **Status:** Integrated into `compare_edit_depth/compare_edit_depth2.py` as `--model marigold_dc` and `MAIN_TEST/img_to_pointcloud_marigold.ipynb`.
+- **Results on new0 (changed):** MAE 10.6 cm, RMSE 18.1 cm — competitive with Depth Pro but not better.
+- **Bring-up notes:** Needed RGB-only input, matched RGB/depth guide sizes, 768px long-edge cap (RTX 3070 Ti 8 GB).
+
+### DepthLab ← tried
+- **Paper:** arxiv:2412.18153
+- **Site:** https://johanan528.github.io/depthlab_web/
+- **Status:** Integrated into `compare_edit_depth/compare_edit_depth2.py` as `--model depthlab`. Results in `v2/{dataset}_results2/depthlab/`.
+- **Results (new4, changed):** MAE 74.8 cm, d1 = 72.4% — fails on new objects.
+- **Results (new4, unchanged):** MAE 2.6 cm — best of all models.
+- **Why it fails on changed:** DepthLab uses GT depth for unchanged pixels as dense guidance; changed pixels receive no guidance and the model propagates surrounding depth rather than predicting correct depth for new geometry.
 
 ---
 

@@ -739,11 +739,11 @@ def main():
     with open(metrics_path, 'w') as f:
         json.dump(all_metrics, f, indent=2)
 
-    # ── Main visualization (2×4) ─────────────────────────────────────────────
+    # ── Main visualization (3×4) ─────────────────────────────────────────────
     from scipy import ndimage
 
-    fig, axes = plt.subplots(2, 4, figsize=(22, 9))
-    plt.subplots_adjust(hspace=0.18, wspace=0.06)
+    fig, axes = plt.subplots(3, 4, figsize=(22, 14))
+    plt.subplots_adjust(hspace=0.22, wspace=0.06)
 
     vmin_d = depth_gt_edit.min()
     vmax_d = depth_gt_edit.max()
@@ -797,6 +797,53 @@ def main():
         f'Error (changed)\nMAE={ch_m["mae"]:.3f}m  δ1={ch_m["d1"]:.3f}', fontsize=11)
     axes[1, 3].axis('off')
     plt.colorbar(im, ax=axes[1, 3], fraction=0.046, pad=0.04, label='m')
+
+    # Row 2: Surface normal alignment
+    if sna_ready:
+        # GT world normals -> RGB (UE stores as N+1, already decoded in _load_world_normal)
+        gt_normal_rgb = np.clip((gt_normals_edit + 1) / 2, 0, 1)
+        axes[2, 0].imshow(gt_normal_rgb)
+        axes[2, 0].set_title('GT Surface Normals', fontsize=11)
+        axes[2, 0].axis('off')
+
+        # Pred world normals from depth_scaled -> RGB
+        n_cam_pred   = _normals_from_depth(depth_scaled, _fx, _fy, _cx, _cy)
+        n_world_pred = (R_cam_to_world @ n_cam_pred.reshape(-1, 3).T).T.reshape(n_cam_pred.shape)
+        n_world_pred = n_world_pred / (np.linalg.norm(n_world_pred, axis=-1, keepdims=True) + 1e-6)
+        pred_normal_rgb = np.clip((n_world_pred + 1) / 2, 0, 1)
+        axes[2, 1].imshow(pred_normal_rgb)
+        axes[2, 1].set_title(f'{model_name}\nPred Surface Normals', fontsize=11)
+        axes[2, 1].axis('off')
+
+        # Angular error (full image)
+        dot     = np.clip((n_world_pred * gt_normals_edit).sum(axis=-1), -1.0, 1.0)
+        ang_err = np.degrees(np.arccos(dot))
+        im = axes[2, 2].imshow(ang_err, cmap='hot_r', vmin=0, vmax=45)
+        axes[2, 2].set_title(
+            f'Normal Angular Error (full)\nSNA mean={sna_unch["sna_mean"]:.1f}° (unch)', fontsize=11)
+        axes[2, 2].axis('off')
+        plt.colorbar(im, ax=axes[2, 2], fraction=0.046, pad=0.04, label='°')
+
+        # Angular error for changed pixels only
+        disc       = _disc_mask(depth_scaled)
+        ang_err_ch = np.where(
+            ndimage.binary_erosion(gt_changed, iterations=1) & ~disc,
+            ang_err, np.nan,
+        )
+        im = axes[2, 3].imshow(ang_err_ch, cmap='hot_r', vmin=0, vmax=45)
+        axes[2, 3].set_title(
+            f'Normal Error (changed)\nSNA={sna_ch["sna_mean"]:.1f}°  <11.25°={sna_ch["pct_11"]:.1f}%',
+            fontsize=11)
+        axes[2, 3].axis('off')
+        plt.colorbar(im, ax=axes[2, 3], fraction=0.046, pad=0.04, label='°')
+    else:
+        for col in range(4):
+            axes[2, col].axis('off')
+        axes[2, 0].text(
+            0.5, 0.5,
+            'Surface normals not available\n(missing camera params or WorldNormal EXR)',
+            ha='center', va='center', transform=axes[2, 0].transAxes, fontsize=11,
+        )
 
     plt.suptitle(
         f'v2 Depth (edit calibration): {model_name} ({scaling_folder}) — GT mask\n'
