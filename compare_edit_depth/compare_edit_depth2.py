@@ -760,9 +760,9 @@ def main():
     plt.colorbar(im, ax=axes[0, 2], fraction=0.046, pad=0.04, label='m')
 
     axes[0, 3].imshow(gt_changed.astype(np.uint8), cmap='RdYlGn_r')
-    axes[0, 3].set_title(
-        f'GT Change Mask\n{gt_changed.mean()*100:.1f}% changed  (thr={args.change_threshold}m)',
-        fontsize=11)
+    mask_title = (f'GT Change Mask\n'
+                  f'{gt_changed.mean()*100:.1f}% changed  (thr={args.change_threshold}m)')
+    axes[0, 3].set_title(mask_title, fontsize=11)
     axes[0, 3].axis('off')
 
     # Row 1: Pred scaled, full error, error unchanged, error changed

@@ -7,6 +7,10 @@ Two loading strategies compared:
   B (proposed) - gamma:   apply sRGB curve first  →  uint8
 
 Runs GeSCF once per strategy, then compares masks.
+
+If the dataset folder contains both original and edited SceneDepth EXRs, the
+script also derives a GT change mask directly from depth diff. Otherwise GT
+comparison is skipped.
 """
 
 import os
@@ -21,10 +25,11 @@ sys.path.insert(0, os.path.join(PROJECT_ROOT, "change_detection_results"))
 import OpenEXR, Imath
 FLOAT = Imath.PixelType(Imath.PixelType.FLOAT)
 
-DATASET_DIR   = os.path.join(PROJECT_ROOT, "data", "depth4")
+DATASET       = "depth4"
+DATASET_DIR   = os.path.join(PROJECT_ROOT, "data", DATASET)
 EXR_PATH      = os.path.join(DATASET_DIR, "HighresScreenshot00000.exr")
 EDIT_PATH     = os.path.join(DATASET_DIR, "edit.png")
-BASELINE_MASK = os.path.join(PROJECT_ROOT, "change_detection_results", "depth4", "gt_mask_depth4.npy")
+GT_CHANGE_THRESHOLD = 0.0
 
 
 # ── Two EXR loading strategies ──────────────────────────────────────────────
@@ -40,6 +45,46 @@ def load_exr_raw_float(path):
         axis=-1,
     )
     return np.clip(rgb, 0.0, 1.0)
+
+
+def load_scene_depth(path, gt_to_cm=10000.0):
+    """Load a single-channel SceneDepth EXR and convert to metres."""
+    exr = OpenEXR.InputFile(path)
+    dw = exr.header()['dataWindow']
+    w = dw.max.x - dw.min.x + 1
+    h = dw.max.y - dw.min.y + 1
+    depth = None
+    for chan_name in ['R', 'SceneDepth', 'Z']:
+        try:
+            depth = np.frombuffer(exr.channel(chan_name, FLOAT), np.float32).reshape(h, w)
+            break
+        except Exception:
+            pass
+    if depth is None:
+        raise RuntimeError(f"Could not read depth channel from {path}")
+    return depth / gt_to_cm
+
+
+def try_build_gt_mask(dataset_dir, threshold=0.0):
+    """
+    Derive GT mask from the two SceneDepth EXRs in a pair dataset.
+
+    Returns (mask, depth_diff) or (None, None) if the dataset does not contain
+    both original and edited GT depth files.
+    """
+    depth_files = sorted(
+        os.path.join(dataset_dir, f)
+        for f in os.listdir(dataset_dir)
+        if 'SceneDepth' in f and 'WorldUnits' not in f and f.lower().endswith('.exr')
+    )
+    if len(depth_files) < 2:
+        return None, None
+
+    depth_gt_orig = load_scene_depth(depth_files[0])
+    depth_gt_edit = load_scene_depth(depth_files[1])
+    depth_diff = depth_gt_edit - depth_gt_orig
+    gt_changed = np.abs(depth_diff) > threshold
+    return gt_changed, depth_diff
 
 
 def linear_to_srgb(x):
@@ -139,14 +184,14 @@ def main():
     print("\n[3] Running GeSCF — B (sRGB gamma)...")
     mask_B, _ = gescf_feature_mask(orig_B, edit_at_exr_res)
 
-    # 4. Load baseline pre-computed mask
-    print("\n[4] Loading baseline mask from disk...")
-    if os.path.exists(BASELINE_MASK):
-        mask_baseline = np.load(BASELINE_MASK)
-        print(f"  Loaded: {BASELINE_MASK}")
+    # 4. Derive GT mask if the dataset has both original and edited depth GT
+    print("\n[4] Deriving GT mask from SceneDepth EXRs (if available)...")
+    mask_baseline, depth_diff = try_build_gt_mask(DATASET_DIR, GT_CHANGE_THRESHOLD)
+    if mask_baseline is not None:
+        print(f"  Derived GT mask from pair depth files in: {DATASET_DIR}")
+        print(f"  GT changed pixels: {mask_baseline.sum():,} ({mask_baseline.mean()*100:.2f}%)")
     else:
-        mask_baseline = None
-        print("  Not found — skipping baseline comparison.")
+        print("  Pair SceneDepth EXRs not found — skipping GT comparison.")
 
     # 5. Report
     print("\n" + "=" * 60)

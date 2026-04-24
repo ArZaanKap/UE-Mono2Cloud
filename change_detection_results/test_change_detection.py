@@ -1,16 +1,49 @@
 """
 Change Detection Model Comparison
 ==================================
-Runs RGB / DINOv2 / GeSCF / CrossAttn change detection on a dataset image pair
-and writes binary masks (.npy) and visualisations (.png) to
-    change_detection_results/{dataset}/
+Runs change detection models on a dataset image pair and writes binary masks
+(.npy) and visualisations (.png) to change_detection_results/output/{dataset}/
 
-Default parameters are read from params.py — edit that file to keep the sweep
-notebooks and this script in sync.
+Default parameters are in params.py — edit there to keep sweep notebooks in sync.
+SAM checkpoint paths are also configured in params.py (SAM2_BASELINE / SAM3_BASELINE).
 
-Usage:
-    python change_detection_results/test_change_detection.py --dataset depth4
-    python change_detection_results/test_change_detection.py --dataset depth4 --skip-dino --skip-crossattn
+Usage
+-----
+  # Run all default models on a dataset
+  python change_detection_results/test_change_detection.py --dataset new3
+
+  # Run every model at once
+  python change_detection_results/test_change_detection.py --dataset new3 \
+      --models rgb dinov2 dinov3 gescf ogescf viewdelta crossattn sam2 sam3
+
+  # Tune per-model parameters
+  python change_detection_results/test_change_detection.py --dataset new3 \
+      --models dinov2 dinov3 gescf ogescf crossattn viewdelta \
+      --rgb-threshold 30 \
+      --dino-threshold 0.3 --dino-sigma 2 --dino-min-area 500 --dino-dilate 3 \
+      --dinov3-threshold 0.3 --dinov3-sigma 2 --dinov3-min-area 500 --dinov3-dilate 3 \
+      --gescf-threshold 0.5 \
+      --ogescf-points 32 --ogescf-iou 0.88 --ogescf-stability 0.95 \
+      --crossattn-threshold 0.4 --crossattn-model dino_2Cross_PSCD \
+      --viewdelta-prompt "object changes" --viewdelta-threshold 0.2
+
+  # SAM 3.1 — auto VLM prompt, or override model / prompt manually
+  python change_detection_results/test_change_detection.py --dataset new3 \
+      --models sam2 sam3 \
+      --sam3-vlm-model google/gemma-4-E2B-it \
+      --sam3-text-prompt "construction equipment,scaffolding"
+
+  # Score against ground-truth depth EXRs
+  python change_detection_results/test_change_detection.py --dataset new3 --change-threshold 0.02 --masks-only
+
+
+  # Skip inference — only re-visualise masks already saved in the dataset folder
+  python change_detection_results/test_change_detection.py --dataset new3 --masks-only
+
+  # Suppress the summary figure (faster batch runs)
+  python change_detection_results/test_change_detection.py --dataset new3 --no-show
+
+Available models: rgb  dinov2  dinov3  gescf  ogescf  viewdelta  crossattn  sam2  sam3  dinov3_sam2  dinov2_sam2
 """
 
 import os, sys, glob, argparse, json, warnings
@@ -32,10 +65,13 @@ from scipy import ndimage
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
+OUTPUT_ROOT  = os.path.join(SCRIPT_DIR, "output")
 sys.path.insert(0, SCRIPT_DIR)
 
 from params import (DINO_BASELINE, DINOV3_BASELINE, GESCF_BASELINE, RGB_BASELINE,
-                    CROSSATTN_BASELINE, VIEWDELTA_BASELINE, OFFICIAL_GESCF_BASELINE)
+                    CROSSATTN_BASELINE, VIEWDELTA_BASELINE, OFFICIAL_GESCF_BASELINE,
+                    SAM2_BASELINE, SAM3_BASELINE, DINOV3_SAM2_BASELINE, DINOV2_SAM2_BASELINE,
+                    DATASET_CHANGE_THRESHOLDS)
 
 DEFAULT_DATASET          = "new3"
 DEFAULT_CHANGE_THRESHOLD = 0.0   # metres — for GT mask derivation from depth diff
@@ -130,6 +166,16 @@ def find_image_pair(folder):
         None,
     )
     return original, edited
+
+
+def find_extra_masks(folder):
+    """Return list of (name, path) for any PNG files with 'mask' in the filename."""
+    files = sorted(os.listdir(folder))
+    return [
+        (os.path.splitext(f)[0], os.path.join(folder, f))
+        for f in files
+        if 'mask' in f.lower() and f.lower().endswith('.png')
+    ]
 
 
 def find_depth_pair(folder):
@@ -470,6 +516,174 @@ def official_gescf_mask(img_t0_path, img_t1_path,
     return mask_full, diff_map
 
 
+def sam2_mask(img1, img2, checkpoint, model_cfg='configs/sam2.1/sam2.1_hiera_l.yaml',
+              diff_thresh=15, dilate=8, min_area_frac=0.001):
+    """SAM 2 change mask: pixel diff → bounding box of largest changed region → SAM 2 box prompt.
+    Needs only the two RGB images — no text, no GT depth."""
+    try:
+        import torch
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+    except ImportError:
+        raise ImportError(
+            "SAM 2 not installed. Run:\n"
+            "  pip install git+https://github.com/facebookresearch/sam2.git\n"
+            "Checkpoints: https://github.com/facebookresearch/sam2#model-description"
+        )
+
+    arr1 = np.array(img1.convert('RGB'), dtype=np.float32)
+    arr2 = np.array(img2.convert('RGB'), dtype=np.float32)
+    diff = np.abs(arr1 - arr2).max(axis=-1)          # max over RGB channels
+    raw  = diff > diff_thresh
+    if dilate > 0:
+        raw = ndimage.binary_dilation(raw, iterations=dilate)
+
+    H, W = arr1.shape[:2]
+    labeled, n = ndimage.label(raw)
+    if n == 0 or ndimage.sum(raw, labeled, range(1, n + 1)).max() < H * W * min_area_frac:
+        print("  [SAM2] No significant diff region — using full image as box.")
+        box = np.array([0, 0, W, H], dtype=np.float32)
+    else:
+        sizes = ndimage.sum(raw, labeled, range(1, n + 1))
+        best  = int(np.argmax(sizes)) + 1
+        comp  = labeled == best
+        rows  = np.where(np.any(comp, axis=1))[0]
+        cols  = np.where(np.any(comp, axis=0))[0]
+        pad   = 12
+        box   = np.array([max(0, cols[0] - pad), max(0, rows[0] - pad),
+                           min(W, cols[-1] + pad), min(H, rows[-1] + pad)], dtype=np.float32)
+    print(f"  [SAM2] Diff bbox: {box.astype(int).tolist()}")
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"  [SAM2] Loading model on {device} …")
+    predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint, device=device))
+    with torch.inference_mode():
+        predictor.set_image(np.array(img2.convert('RGB')))
+        masks, scores, _ = predictor.predict(
+            point_coords=None, point_labels=None,
+            box=box, multimask_output=True,
+        )
+    mask = masks[int(np.argmax(scores))].astype(bool)
+    return mask, diff
+
+
+def dinov3_sam2_mask(img1, img2,
+                     checkpoint,
+                     model_cfg='configs/sam2.1/sam2.1_hiera_l.yaml',
+                     dino_threshold=DINOV3_SAM2_BASELINE['dino_threshold'],
+                     sigma=DINOV3_SAM2_BASELINE['sigma'],
+                     dilate=DINOV3_SAM2_BASELINE['dilate'],
+                     model_name=DINOV3_SAM2_BASELINE['model_name'],
+                     min_area_frac=0.001):
+    """DINO feature distance map → one box per significant changed region → SAM2.
+
+    Finds all changed regions above min_area_frac, runs SAM2 once per box,
+    and unions the resulting masks so multiple changed objects are captured.
+    """
+    try:
+        import torch
+        from sam2.build_sam import build_sam2
+        from sam2.sam2_image_predictor import SAM2ImagePredictor
+    except ImportError:
+        raise ImportError(
+            "SAM 2 not installed. Run:\n"
+            "  pip install git+https://github.com/facebookresearch/sam2.git"
+        )
+
+    # Step 1 — DINO feature distance map
+    tag = 'DINOv3→SAM2' if 'dinov3' in model_name.lower() else 'DINOv2→SAM2'
+    _, dist_map = dinov2_feature_mask(
+        img1, img2,
+        threshold=dino_threshold,
+        sigma=sigma,
+        min_area=0,
+        dilate_iter=0,
+        model_name=model_name,
+    )
+
+    # Step 2 — find ALL significant changed regions
+    H, W = dist_map.shape
+    raw = dist_map > dino_threshold
+    if dilate > 0:
+        raw = ndimage.binary_dilation(raw, iterations=dilate)
+
+    labeled, n = ndimage.label(raw)
+    min_pixels = H * W * min_area_frac
+    boxes = []
+    if n > 0:
+        sizes = ndimage.sum(raw, labeled, range(1, n + 1))
+        for idx, size in enumerate(sizes, 1):
+            if size < min_pixels:
+                continue
+            comp = labeled == idx
+            rows = np.where(np.any(comp, axis=1))[0]
+            cols = np.where(np.any(comp, axis=0))[0]
+            pad  = 12
+            boxes.append(np.array([
+                max(0, cols[0] - pad), max(0, rows[0] - pad),
+                min(W, cols[-1] + pad), min(H, rows[-1] + pad),
+            ], dtype=np.float32))
+
+    if not boxes:
+        print(f"  [{tag}] No significant feature diff — using full image as box.")
+        boxes = [np.array([0, 0, W, H], dtype=np.float32)]
+
+    print(f"  [{tag}] {len(boxes)} region(s) found")
+    for b in boxes:
+        print(f"  [{tag}]   bbox: {b.astype(int).tolist()}")
+
+    # Step 3 — SAM2: one predict per region, union all masks
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"  [{tag}] Loading SAM2 on {device} …")
+    predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint, device=device))
+    combined = np.zeros((H, W), dtype=bool)
+    with torch.inference_mode():
+        predictor.set_image(np.array(img2.convert('RGB')))
+        for box in boxes:
+            masks, scores, _ = predictor.predict(
+                point_coords=None, point_labels=None,
+                box=box, multimask_output=True,
+            )
+            combined |= masks[int(np.argmax(scores))].astype(bool)
+    return combined, dist_map
+
+
+def sam3_mask(img1, img2, checkpoint,
+              text_prompt=SAM3_BASELINE['text_prompt'],
+              vlm_model=SAM3_BASELINE['vlm_model']):
+    """
+    SAM 3.1 change mask: VLM generates a precise text description of what
+    changed, which is passed as a text prompt to SAM 3.1.
+
+    If text_prompt is provided it is used directly (VLM step is skipped).
+    text_prompt may be a string, comma-separated string, or list of prompts.
+    Otherwise vlm_model is loaded to auto-generate the description.
+
+    Requires:
+      pip install git+https://github.com/facebookresearch/sam3.git
+    Weights (gated): https://huggingface.co/facebook/sam3.1
+    """
+    # Import shared helpers from sam_mask_infer (same directory)
+    from sam_mask_infer import generate_vlm_description, run_sam3_text
+
+    prompt = text_prompt
+    if prompt is None:
+        print(f"  [SAM3] No text_prompt — running VLM ({vlm_model}) to generate one ...")
+        prompt = generate_vlm_description(
+            img1,
+            img2,
+            vlm_model,
+        )
+        print(f"  [SAM3] VLM raw output: '{prompt}'")
+        print(f"  [SAM3] Prompt fed to SAM3: '{prompt}'")
+    else:
+        print(f"  [SAM3] Using text prompt: '{prompt}'")
+
+    mask = run_sam3_text(img2, prompt, checkpoint)
+    # Return a dummy diff map (binary mask as float) since SAM3 has no scalar diff map
+    return mask, mask.astype(np.float32)
+
+
 def viewdelta_mask(img1, img2,
                    text_prompt=VIEWDELTA_BASELINE['text_prompt'],
                    threshold=VIEWDELTA_BASELINE['threshold']):
@@ -662,14 +876,11 @@ def _save_summary_png(original_img, edited_img, results, out_dir, dataset, gt_ch
 
 
 def _clean_old_outputs(out_dir, dataset):
-    removed = []
-    for pat in [f"*_{dataset}.png", f"change_detection_{dataset}.png"]:
-        for f in glob.glob(os.path.join(out_dir, pat)):
-            if os.path.basename(f).startswith("gt_mask_"):
-                continue
-            os.remove(f); removed.append(os.path.basename(f))
-    if removed:
-        print(f"Cleaned: {', '.join(removed)}")
+    # Only remove the summary PNG — individual model PNGs are overwritten in-place.
+    summary = os.path.join(out_dir, f"summary_{dataset}.png")
+    if os.path.exists(summary):
+        os.remove(summary)
+        print(f"Cleaned: summary_{dataset}.png")
 
 
 # ---------------------------------------------------------------------------
@@ -697,28 +908,40 @@ def main():
     p.add_argument('--ogescf-points',     type=int,   default=OFFICIAL_GESCF_BASELINE['points_per_side'])
     p.add_argument('--ogescf-iou',        type=float, default=OFFICIAL_GESCF_BASELINE['pred_iou_thresh'])
     p.add_argument('--ogescf-stability',  type=float, default=OFFICIAL_GESCF_BASELINE['stability_score_thresh'])
-    p.add_argument('--skip-ogescf',       action='store_true')
     p.add_argument('--viewdelta-prompt',    default=VIEWDELTA_BASELINE['text_prompt'],
                    help='Text prompt for ViewDelta (e.g. "all changes", "object changes")')
     p.add_argument('--viewdelta-threshold', type=float, default=VIEWDELTA_BASELINE['threshold'],
                    help='Probability threshold for ViewDelta mask (default 0.15)')
-    p.add_argument('--skip-dino',        action='store_true')
-    p.add_argument('--skip-dinov3',      action='store_true')
-    p.add_argument('--skip-gescf',       action='store_true')
-    p.add_argument('--skip-crossattn',   action='store_true')
-    p.add_argument('--skip-viewdelta',   action='store_true')
+    p.add_argument('--sam3-text-prompt', default=SAM3_BASELINE['text_prompt'],
+                   help='Manual SAM 3 text prompt or comma-separated prompt list. '
+                        'If unset, the configured VLM generates one automatically.')
+    p.add_argument('--sam3-vlm-model', default=SAM3_BASELINE['vlm_model'],
+                   help='SAM 3 Gemma 4 VLM for auto prompt generation '
+                        '(e.g. google/gemma-4-E2B-it)')
+    p.add_argument('--models', nargs='+',
+                   choices=['rgb', 'dinov2', 'dinov3', 'gescf', 'ogescf',
+                            'viewdelta', 'crossattn', 'sam2', 'sam3', 'dinov3_sam2', 'dinov2_sam2'],
+                   default=['rgb', 'dinov2', 'dinov3', 'gescf', 'ogescf', 'viewdelta', 'crossattn'],
+                   metavar='MODEL',
+                   help='Models to run. Choices: rgb dinov2 dinov3 gescf ogescf viewdelta crossattn sam2 sam3 dinov3_sam2 dinov2_sam2. '
+                        'SAM checkpoint paths are configured in params.py.')
     p.add_argument('--no-show',        action='store_true')
+    p.add_argument('--masks-only',     action='store_true',
+                   help='Skip all model inference — only visualise extra masks found in the dataset folder')
     # GT depth scoring (optional — enables per-method scoring vs ground truth)
     p.add_argument('--gt-depth-orig',    default=None,
                    help='Path to original GT depth EXR (for GT mask derivation)')
     p.add_argument('--gt-depth-edit',    default=None,
                    help='Path to edited GT depth EXR (for GT mask derivation)')
-    p.add_argument('--change-threshold', type=float, default=DEFAULT_CHANGE_THRESHOLD,
-                   help='Depth diff threshold (m) to derive GT change mask')
+    p.add_argument('--change-threshold', type=float, default=None,
+                   help='Depth diff threshold (m) to derive GT change mask '
+                        '(default: per-dataset value from DATASET_CHANGE_THRESHOLDS in params.py)')
     args = p.parse_args()
+    if args.change_threshold is None:
+        args.change_threshold = DATASET_CHANGE_THRESHOLDS.get(args.dataset, DEFAULT_CHANGE_THRESHOLD)
 
     data_dir = os.path.join(PROJECT_ROOT, "data", args.dataset)
-    out_dir  = os.path.join(SCRIPT_DIR, args.dataset)
+    out_dir  = os.path.join(OUTPUT_ROOT, args.dataset)
     os.makedirs(out_dir, exist_ok=True)
 
     print("=" * 60)
@@ -750,6 +973,10 @@ def main():
     else:
         print("GT scoring disabled (no GT depth pair found)")
 
+    extra_masks = find_extra_masks(data_dir)
+    if extra_masks:
+        print(f"Extra masks found: {', '.join(n for n, _ in extra_masks)}")
+
     original_img = load_image(original_path)
     edited_img   = load_image(edited_path)
     if edited_img.size != original_img.size:
@@ -776,30 +1003,32 @@ def main():
         print(f"GT change mask: {gt_changed.sum():,} changed px "
               f"({gt_changed.mean()*100:.2f}%) at threshold {args.change_threshold} m")
 
-        # Save GT mask
+        # Save GT mask visualisation
         depth_diff = np.abs(depth_gt_edit - depth_gt_orig)
-        np.save(os.path.join(out_dir, f"gt_mask_{args.dataset}.npy"), gt_changed)
         _save_method_png(original_img, edited_img, depth_diff, gt_changed,
                          "GT mask", out_dir, args.dataset,
                          vmax=np.percentile(depth_diff, 99))
 
     _clean_old_outputs(out_dir, args.dataset)
     results = {}
+    run = set() if args.masks_only else set(args.models)
+    print(f"Models: {', '.join(sorted(run)) or '(none — masks-only)'}")
 
     # ── RGB ──────────────────────────────────────────────────────────────────
-    print("\n--- RGB threshold ---")
-    rgb_mask, rgb_diff = rgb_threshold_mask(
-        original_img, edited_img,
-        threshold=args.rgb_threshold,
-        min_area=RGB_BASELINE['min_area'],
-        dilate_iter=RGB_BASELINE['dilate_iter'],
-    )
-    print(f"  threshold={args.rgb_threshold}  changed={rgb_mask.mean()*100:.2f}%")
-    results['RGB'] = {'mask': rgb_mask, 'diff_map': rgb_diff}
-    _save_method_png(original_img, edited_img, rgb_diff, rgb_mask, "RGB", out_dir, args.dataset, vmax=80)
+    if 'rgb' in run:
+        print("\n--- RGB threshold ---")
+        rgb_mask, rgb_diff = rgb_threshold_mask(
+            original_img, edited_img,
+            threshold=args.rgb_threshold,
+            min_area=RGB_BASELINE['min_area'],
+            dilate_iter=RGB_BASELINE['dilate_iter'],
+        )
+        print(f"  threshold={args.rgb_threshold}  changed={rgb_mask.mean()*100:.2f}%")
+        results['RGB'] = {'mask': rgb_mask, 'diff_map': rgb_diff}
+        _save_method_png(original_img, edited_img, rgb_diff, rgb_mask, "RGB", out_dir, args.dataset, vmax=80)
 
     # ── DINOv2 ───────────────────────────────────────────────────────────────
-    if not args.skip_dino:
+    if 'dinov2' in run:
         print("\n--- DINOv2 ---")
         try:
             dino_mask, dino_diff = dinov2_feature_mask(
@@ -817,7 +1046,7 @@ def main():
             print(f"  ERROR: {e}")
 
     # ── DINOv3 ───────────────────────────────────────────────────────────────
-    if not args.skip_dinov3:
+    if 'dinov3' in run:
         print("\n--- DINOv3 ---")
         try:
             dv3_mask, dv3_diff = dinov2_feature_mask(
@@ -836,7 +1065,7 @@ def main():
             print(f"  ERROR: {e}")
 
     # ── GeSCF ────────────────────────────────────────────────────────────────
-    if not args.skip_gescf:
+    if 'gescf' in run:
         print("\n--- GeSCF ---")
         try:
             gescf_mask, gescf_diff = gescf_feature_mask(
@@ -852,7 +1081,7 @@ def main():
             print(f"  SKIPPED: {e}")
 
     # ── Official GeSCF ───────────────────────────────────────────────────────
-    if not args.skip_ogescf:
+    if 'ogescf' in run:
         print("\n--- Official GeSCF (ViT-H, layer 17/32) ---")
         try:
             og_mask, og_diff = official_gescf_mask(
@@ -869,7 +1098,7 @@ def main():
             print(f"  SKIPPED: {e}")
 
     # ── ViewDelta ─────────────────────────────────────────────────────────────
-    if not args.skip_viewdelta:
+    if 'viewdelta' in run:
         print(f"\n--- ViewDelta (prompt: '{args.viewdelta_prompt}') ---")
         try:
             vd_mask, vd_prob = viewdelta_mask(
@@ -885,7 +1114,7 @@ def main():
             print(f"  SKIPPED: {e}")
 
     # ── CrossAttn ────────────────────────────────────────────────────────────
-    if not args.skip_crossattn:
+    if 'crossattn' in run:
         print("\n--- CrossAttn ---")
         try:
             ca_mask, ca_prob = dino_crossattn_mask(
@@ -899,6 +1128,97 @@ def main():
                              "CrossAttn", out_dir, args.dataset, vmax=1.0)
         except Exception as e:
             print(f"  SKIPPED: {e}")
+
+    # ── SAM 2 ────────────────────────────────────────────────────────────────────
+    if 'sam2' in run:
+        ckpt2 = os.path.join(PROJECT_ROOT, SAM2_BASELINE['checkpoint'])
+        if not os.path.isfile(ckpt2):
+            print(f"\n--- SAM 2 skipped (checkpoint not found: {SAM2_BASELINE['checkpoint']}) ---")
+        else:
+            print("\n--- SAM 2 (pixel diff → box prompt) ---")
+            try:
+                s2_mask, s2_diff = sam2_mask(
+                    original_img, edited_img,
+                    checkpoint=ckpt2,
+                    model_cfg=SAM2_BASELINE['model_cfg'],
+                    diff_thresh=SAM2_BASELINE['diff_thresh'],
+                    dilate=SAM2_BASELINE['dilate'],
+                )
+                print(f"  changed={s2_mask.mean()*100:.2f}%")
+                results['SAM2'] = {'mask': s2_mask, 'diff_map': s2_diff}
+                _save_method_png(original_img, edited_img, s2_diff, s2_mask,
+                                 "SAM2", out_dir, args.dataset, vmax=80)
+            except Exception as e:
+                print(f"  SKIPPED: {e}")
+
+    # ── DINOv3 → SAM2 ────────────────────────────────────────────────────────────
+    if 'dinov3_sam2' in run:
+        ckpt_d3s2 = os.path.join(PROJECT_ROOT, DINOV3_SAM2_BASELINE['checkpoint'])
+        if not os.path.isfile(ckpt_d3s2):
+            print(f"\n--- DINOv3→SAM2 skipped (checkpoint not found: {DINOV3_SAM2_BASELINE['checkpoint']}) ---")
+        else:
+            print("\n--- DINOv3→SAM2 (feature diff → per-region box prompts) ---")
+            try:
+                d3s2_mask, d3s2_diff = dinov3_sam2_mask(
+                    original_img, edited_img,
+                    checkpoint=ckpt_d3s2,
+                    model_cfg=DINOV3_SAM2_BASELINE['model_cfg'],
+                    dino_threshold=DINOV3_SAM2_BASELINE['dino_threshold'],
+                    sigma=DINOV3_SAM2_BASELINE['sigma'],
+                    dilate=DINOV3_SAM2_BASELINE['dilate'],
+                    model_name=DINOV3_SAM2_BASELINE['model_name'],
+                )
+                print(f"  changed={d3s2_mask.mean()*100:.2f}%")
+                results['DINOv3→SAM2'] = {'mask': d3s2_mask, 'diff_map': d3s2_diff}
+                _save_method_png(original_img, edited_img, d3s2_diff, d3s2_mask,
+                                 "DINOv3_SAM2", out_dir, args.dataset, vmax=0.5)
+            except Exception as e:
+                print(f"  SKIPPED: {e}")
+
+    # ── DINOv2 → SAM2 ────────────────────────────────────────────────────────────
+    if 'dinov2_sam2' in run:
+        ckpt_d2s2 = os.path.join(PROJECT_ROOT, DINOV2_SAM2_BASELINE['checkpoint'])
+        if not os.path.isfile(ckpt_d2s2):
+            print(f"\n--- DINOv2→SAM2 skipped (checkpoint not found: {DINOV2_SAM2_BASELINE['checkpoint']}) ---")
+        else:
+            print("\n--- DINOv2→SAM2 (feature diff → per-region box prompts) ---")
+            try:
+                d2s2_mask, d2s2_diff = dinov3_sam2_mask(
+                    original_img, edited_img,
+                    checkpoint=ckpt_d2s2,
+                    model_cfg=DINOV2_SAM2_BASELINE['model_cfg'],
+                    dino_threshold=DINOV2_SAM2_BASELINE['dino_threshold'],
+                    sigma=DINOV2_SAM2_BASELINE['sigma'],
+                    dilate=DINOV2_SAM2_BASELINE['dilate'],
+                    model_name=DINOV2_SAM2_BASELINE['model_name'],
+                )
+                print(f"  changed={d2s2_mask.mean()*100:.2f}%")
+                results['DINOv2→SAM2'] = {'mask': d2s2_mask, 'diff_map': d2s2_diff}
+                _save_method_png(original_img, edited_img, d2s2_diff, d2s2_mask,
+                                 "DINOv2_SAM2", out_dir, args.dataset, vmax=0.5)
+            except Exception as e:
+                print(f"  SKIPPED: {e}")
+
+    # ── SAM 3.1 (VLM → text prompt → segmentation) ───────────────────────────────
+    if 'sam3' in run:
+        ckpt3 = os.path.join(PROJECT_ROOT, SAM3_BASELINE['checkpoint'])
+        if not os.path.exists(ckpt3):
+            print(f"\n--- SAM 3.1 skipped (weights not found: {SAM3_BASELINE['checkpoint']}) ---")
+        else:
+            print("\n--- SAM 3.1 (VLM → text prompt) ---")
+            try:
+                s3_mask, s3_diff = sam3_mask(
+                    original_img, edited_img,
+                    checkpoint=ckpt3,
+                    text_prompt=args.sam3_text_prompt,
+                    vlm_model=args.sam3_vlm_model,
+                )
+                print(f"  changed={s3_mask.mean()*100:.2f}%")
+                results['SAM3'] = {'mask': s3_mask, 'diff_map': s3_diff}
+                _save_method_png(original_img, edited_img, s3_diff, s3_mask,
+                                 "SAM3", out_dir, args.dataset, vmax=1.0)
+            except Exception as e:
+                print(f"  SKIPPED: {e}")
 
     # ── GT mask scoring (before summary so scores appear in image titles) ────────
     detection_scores = None
@@ -921,22 +1241,63 @@ def main():
             detection_scores['methods'][name] = scores
             results[name]['scores'] = scores  # stored so summary can show F1/IoU in titles
 
+    # ── Extra mask visualisation + scoring ───────────────────────────────────
+    if extra_masks:
+        h_img, w_img = np.array(original_img).shape[:2]
+        for mask_name, mask_path in extra_masks:
+            extra_arr = np.array(
+                Image.open(mask_path).convert('L').resize((w_img, h_img), Image.NEAREST)
+            ) > 127
+            _save_method_png(original_img, edited_img, extra_arr.astype(np.float32),
+                             extra_arr, mask_name, out_dir, args.dataset, vmax=1.0)
+            print(f"Saved: {mask_name}_{args.dataset}.png  ({extra_arr.mean()*100:.2f}% changed)")
+
+            if results:
+                if detection_scores is None:
+                    detection_scores = {}
+                detection_scores.setdefault('extra_masks', {})
+                print(f"\n{'='*65}")
+                print(f"SCORING vs EXTRA MASK: {mask_name}")
+                print(f"{'='*65}")
+                print(f"{'Method':<14} {'Precision':>10} {'Recall':>10} {'F1':>10} {'IoU':>10}")
+                print("-" * 65)
+                mask_method_scores = {}
+                for name, data in results.items():
+                    pred = data['mask']
+                    if pred.shape != extra_arr.shape:
+                        pred = np.array(
+                            Image.fromarray(pred.astype(np.uint8) * 255).resize(
+                                (extra_arr.shape[1], extra_arr.shape[0]), Image.NEAREST
+                            )
+                        ) > 127
+                    s = _score_mask(pred, extra_arr)
+                    mask_method_scores[name] = s
+                    print(f"{name:<14} {s['precision']:>10.3f} {s['recall']:>10.3f} "
+                          f"{s['f1']:>10.3f} {s['iou']:>10.3f}")
+                print("=" * 65)
+                detection_scores['extra_masks'][mask_name] = {
+                    'changed_pixels': int(extra_arr.sum()),
+                    'changed_frac':   float(extra_arr.mean()),
+                    'methods':        mask_method_scores,
+                }
+
     if results:
         _save_summary_png(original_img, edited_img, results, out_dir, args.dataset,
                           gt_changed=gt_changed)
 
     # ── Print scores + save JSON ──────────────────────────────────────────────
     if detection_scores is not None:
-        print("\n" + "=" * 65)
-        print("SCORING vs GT CHANGE MASK")
-        print("=" * 65)
-        print(f"{'Method':<12} {'Precision':>10} {'Recall':>10} {'F1':>10} {'IoU':>10}")
-        print("-" * 65)
-        for name in results:
-            s = detection_scores['methods'][name]
-            print(f"{name:<12} {s['precision']:>10.3f} {s['recall']:>10.3f} "
-                  f"{s['f1']:>10.3f} {s['iou']:>10.3f}")
-        print("=" * 65)
+        if 'methods' in detection_scores and detection_scores['methods']:
+            print("\n" + "=" * 65)
+            print("SCORING vs GT CHANGE MASK")
+            print("=" * 65)
+            print(f"{'Method':<14} {'Precision':>10} {'Recall':>10} {'F1':>10} {'IoU':>10}")
+            print("-" * 65)
+            for name in results:
+                s = detection_scores['methods'][name]
+                print(f"{name:<14} {s['precision']:>10.3f} {s['recall']:>10.3f} "
+                      f"{s['f1']:>10.3f} {s['iou']:>10.3f}")
+            print("=" * 65)
 
         scores_path = os.path.join(out_dir, "detection_scores.json")
         with open(scores_path, 'w') as f:

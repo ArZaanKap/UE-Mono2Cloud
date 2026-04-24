@@ -36,9 +36,13 @@ python change_detection_results/test_change_detection.py --dataset new0
 python change_detection_results/test_change_detection.py --dataset new4 --skip-dino --skip-crossattn
 ```
 
-Outputs go to `change_detection_results/{dataset}/`.
+Outputs go to `change_detection_results/output/{dataset}/`.
 
-Default method parameters are in `params.py` — edit there to keep the sweep notebooks in sync.
+Default method parameters are in `params.py` - edit there to keep the sweep notebooks in sync.
+For SAM 3, you can override the auto-prompt VLM at runtime with
+`--sam3-vlm-model google/gemma-4-E2B-it`.
+Auto prompt generation loads Gemma 4 in float32 on CPU.
+If you pass `--sam3-text-prompt`, the VLM step is skipped entirely.
 
 ---
 
@@ -63,7 +67,8 @@ Default method parameters are in `params.py` — edit there to keep the sweep no
 
 ```
 change_detection_results/
-  new0/
+  output/
+    new0/
     rgb_new0.png               # Visualisation of each mask
     dinov2_new0.png
     gescf_new0.png
@@ -72,8 +77,9 @@ change_detection_results/
     detection_scores.json      # IoU / F1 scores vs GT mask (pair datasets only)
 ```
 
-The `.npy` masks are loaded by v1 depth evaluation scripts and point cloud notebooks.
-For v2 (`compare_edit_depth2.py`), the change mask is derived from GT depth diff directly — `.npy` files are not needed.
+The saved outputs are visualisations plus per-method prediction `.npy` masks.
+The GT change mask is derived directly from depth diff where needed rather than
+being stored as a separate `.npy` dependency.
 
 ---
 
