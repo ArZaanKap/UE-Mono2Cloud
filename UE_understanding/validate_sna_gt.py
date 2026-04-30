@@ -11,7 +11,7 @@ This answers two questions:
   B. What is the ceiling angular error of the finite-difference method?
      (even with perfect depth, edge noise from finite diffs sets a floor)
 
-Only works on datasets with camera_params.json fully filled in.
+Only works on datasets with params.json fully filled in.
 Filled-in datasets: new2, new3
 
 Usage:
@@ -212,7 +212,7 @@ def main():
         description='Validate SNA ceiling accuracy: GT depth → normals vs GT WorldNormal EXR'
     )
     parser.add_argument('--dataset', default='new2',
-                        help='Dataset folder under data/ (needs camera_params.json)')
+                        help='Dataset folder under data/ (needs params.json)')
     parser.add_argument('--image', type=int, default=0, choices=[0, 1],
                         help='Which image pair index to use (0=original, 1=edited)')
     parser.add_argument('--no-show', action='store_true')
@@ -222,14 +222,14 @@ def main():
 
     # ── Load camera params ───────────────────────────────────────────────────
     folder  = os.path.join(PROJECT_ROOT, "data", args.dataset)
-    cp_path = os.path.join(folder, "camera_params.json")
+    cp_path = os.path.join(folder, "params.json")
     if not os.path.exists(cp_path):
-        sys.exit(f"No camera_params.json in {folder}")
+        sys.exit(f"No params.json in {folder}")
     with open(cp_path) as f:
         cp = json.load(f)
     for key in ('fov_deg', 'pitch_deg', 'yaw_deg', 'roll_deg'):
         if cp.get(key) is None:
-            sys.exit(f"camera_params.json missing '{key}' — "
+            sys.exit(f"params.json missing '{key}' — "
                      f"fill in from UE Details panel first.\n"
                      f"Datasets with full params: new2, new3")
 

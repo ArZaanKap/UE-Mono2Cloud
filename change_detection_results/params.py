@@ -9,6 +9,17 @@ DINO_BASELINE = dict(
     dilate_iter = 2,
 )
 
+DINOX_BASELINE = dict(
+    model_name     = "DINO-X-1.0",
+    token_env      = "DINOX_API_TOKEN",
+    text_prompt    = None,   # None -> prompt-free "detect anything"
+    bbox_threshold = 0.25,
+    iou_threshold  = 0.80,
+    match_iou      = 0.30,
+    min_area       = 500,
+    dilate_iter    = 2,
+)
+
 DINOV3_BASELINE = dict(
     threshold   = 0.12,
     sigma       = 4,
@@ -63,17 +74,6 @@ SAM2_BASELINE = dict(
     diff_thresh = 15.0,
     dilate      = 8,
 )
-
-# Per-dataset depth-diff threshold (metres) for GT change mask derivation.
-# Used as the default when --change-threshold is not passed on the CLI.
-# Set to 0.0 to treat every non-zero depth diff as a change.
-DATASET_CHANGE_THRESHOLDS = {
-    'new0':   0.06,
-    'new1':   0.05,
-    'new2':   0.0,
-    'new3':   0.0,
-    'new4':   0.02,
-}
 
 # DINO → SAM2: use DINO feature distance map to generate SAM2 box prompts
 # (one box per significant changed region) instead of the raw pixel-diff box.

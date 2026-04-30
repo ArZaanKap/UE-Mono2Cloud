@@ -1,0 +1,37 @@
+{
+  "promptda_vitl_guided": {
+    "scale": 1.0,
+    "shift": 0.0,
+    "scaling": "promptda_guided",
+    "change_threshold_m": 0.06,
+    "gt_changed_frac": 0.05561563818444552,
+    "edit_unchanged": {
+      "n": 1236490,
+      "mae": 0.05453413724899292,
+      "rmse": 0.08447617292404175,
+      "d1": 0.9997759787786396,
+      "d2": 0.9997953885595516,
+      "d3": 1.0,
+      "sna_mean": NaN,
+      "sna_median": NaN,
+      "pct_11": NaN,
+      "pct_22": NaN,
+      "pct_30": NaN
+    },
+    "edit_changed": {
+      "n": 72818,
+      "mae": 0.17707067728042603,
+      "rmse": 0.2469901293516159,
+      "d1": 0.9957702765799665,
+      "d2": 1.0,
+      "d3": 1.0,
+      "sna_mean": NaN,
+      "sna_median": NaN,
+      "pct_11": NaN,
+      "pct_22": NaN,
+      "pct_30": NaN
+    },
+    "guidance_pixels": 1236490,
+    "pre_resize_max_res": 768
+  }
+}

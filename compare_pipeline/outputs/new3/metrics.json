@@ -1,0 +1,167 @@
+{
+  "dinov2__da3_giant": {
+    "mask_model": "dinov2",
+    "depth_model": "da3_giant",
+    "dataset": "new3",
+    "change_threshold_m": 0.0,
+    "changed": {
+      "n": 152072,
+      "mae": 0.16083963215351105,
+      "rmse": 0.33659836649894714,
+      "d1": 0.9894852438318691,
+      "d2": 0.9936937766321217,
+      "d3": 0.9950615497922037
+    },
+    "unchanged": {
+      "n": 1157236,
+      "mae": 0.11542724072933197,
+      "rmse": 0.17639128863811493,
+      "d1": 0.9992749966299009,
+      "d2": 0.9995143600786702,
+      "d3": 0.9999187719704538
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 885993,
+      "fit_pixels_final": 885993,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.3233120090918256,
+    "gt_changed_frac": 0.11614685009180423,
+    "mask_wall_s": 6.74,
+    "depth_wall_s": 59.15
+  },
+  "dinov2__dpro": {
+    "mask_model": "dinov2",
+    "depth_model": "dpro",
+    "dataset": "new3",
+    "change_threshold_m": 0.0,
+    "changed": {
+      "n": 152072,
+      "mae": 0.25627264380455017,
+      "rmse": 0.29058486223220825,
+      "d1": 0.9549686990372981,
+      "d2": 0.9981982218948919,
+      "d3": 0.999066231784944
+    },
+    "unchanged": {
+      "n": 1157236,
+      "mae": 0.11817000061273575,
+      "rmse": 0.17836761474609375,
+      "d1": 0.9991030351630955,
+      "d2": 0.9996154630516161,
+      "d3": 0.9998289026611685
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 885993,
+      "fit_pixels_final": 885993,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.3233120090918256,
+    "gt_changed_frac": 0.11614685009180423,
+    "mask_wall_s": 6.73,
+    "depth_wall_s": 14.77
+  },
+  "dinov2__moge2": {
+    "mask_model": "dinov2",
+    "depth_model": "moge2",
+    "dataset": "new3",
+    "change_threshold_m": 0.0,
+    "changed": {
+      "n": 152072,
+      "mae": 0.08448854088783264,
+      "rmse": 0.15582215785980225,
+      "d1": 0.9937398074596244,
+      "d2": 0.9980009469198801,
+      "d3": 0.9992635067599558
+    },
+    "unchanged": {
+      "n": 1157236,
+      "mae": 0.2770628035068512,
+      "rmse": 0.4250081181526184,
+      "d1": 0.9944756298628802,
+      "d2": 0.9993311649482042,
+      "d3": 0.9997312562001183
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 885993,
+      "fit_pixels_final": 885993,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.3233120090918256,
+    "gt_changed_frac": 0.11614685009180423,
+    "mask_wall_s": 6.76,
+    "depth_wall_s": 6.95
+  },
+  "dinov2__unidepth_vitl": {
+    "mask_model": "dinov2",
+    "depth_model": "unidepth_vitl",
+    "dataset": "new3",
+    "change_threshold_m": 0.0,
+    "changed": {
+      "n": 152072,
+      "mae": 0.11590070277452469,
+      "rmse": 0.21247050166130066,
+      "d1": 0.9920103635120207,
+      "d2": 0.9957520122047451,
+      "d3": 0.997632700299858
+    },
+    "unchanged": {
+      "n": 1157236,
+      "mae": 0.15546947717666626,
+      "rmse": 0.26482194662094116,
+      "d1": 0.9987547915896152,
+      "d2": 0.9995973163641643,
+      "d3": 0.9998859351074457
+    },
+    "fit_info": {
+      "fit_strategy": "ls_trimmed",
+      "fit_pixels_initial": 885993,
+      "fit_pixels_final": 841693,
+      "fit_trim_keep_percent": 95.0,
+      "fit_trim_applied": true
+    },
+    "pred_changed_frac": 0.3233120090918256,
+    "gt_changed_frac": 0.11614685009180423,
+    "mask_wall_s": 6.75,
+    "depth_wall_s": 10.22
+  },
+  "dinov2__unik3d": {
+    "mask_model": "dinov2",
+    "depth_model": "unik3d",
+    "dataset": "new3",
+    "change_threshold_m": 0.0,
+    "changed": {
+      "n": 152072,
+      "mae": 0.12568998336791992,
+      "rmse": 0.21634262800216675,
+      "d1": 0.9920169393445211,
+      "d2": 0.9956533747172392,
+      "d3": 0.9977116102898627
+    },
+    "unchanged": {
+      "n": 1157236,
+      "mae": 0.18281348049640656,
+      "rmse": 0.2761313319206238,
+      "d1": 0.9988697206101435,
+      "d2": 0.999641386890833,
+      "d3": 0.9998867992354196
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 885993,
+      "fit_pixels_final": 885993,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.3233120090918256,
+    "gt_changed_frac": 0.11614685009180423,
+    "mask_wall_s": 6.75,
+    "depth_wall_s": 10.54
+  }
+}

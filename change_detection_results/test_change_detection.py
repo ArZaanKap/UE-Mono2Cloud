@@ -14,7 +14,7 @@ Usage
 
   # Run every model at once
   python change_detection_results/test_change_detection.py --dataset new3 \
-      --models rgb dinov2 dinov3 gescf ogescf viewdelta crossattn sam2 sam3
+      --models rgb dinov2 dinov3 dinox gescf ogescf viewdelta crossattn sam2 sam3
 
   # Tune per-model parameters
   python change_detection_results/test_change_detection.py --dataset new3 \
@@ -43,18 +43,20 @@ Usage
   # Suppress the summary figure (faster batch runs)
   python change_detection_results/test_change_detection.py --dataset new3 --no-show
 
-Available models: rgb  dinov2  dinov3  gescf  ogescf  viewdelta  crossattn  sam2  sam3  dinov3_sam2  dinov2_sam2
+Available models: rgb  dinov2  dinov3  dinox  gescf  ogescf  viewdelta  crossattn  sam2  sam3  dinov3_sam2  dinov2_sam2
 """
 
 import os, sys, glob, argparse, json, warnings
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 warnings.filterwarnings("ignore", message=".*use_fast.*")
 warnings.filterwarnings("ignore", message=".*grid_sample.*")
 warnings.filterwarnings("ignore", message=".*Xet Storage.*")
 warnings.filterwarnings("ignore", message=".*timm.models.layers.*")
 warnings.filterwarnings("ignore", category=FutureWarning)
 import numpy as np
+import cv2
 from PIL import Image
 import matplotlib
 matplotlib.use("Agg")
@@ -68,10 +70,10 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 OUTPUT_ROOT  = os.path.join(SCRIPT_DIR, "output")
 sys.path.insert(0, SCRIPT_DIR)
 
-from params import (DINO_BASELINE, DINOV3_BASELINE, GESCF_BASELINE, RGB_BASELINE,
+from params import (DINO_BASELINE, DINOX_BASELINE, DINOV3_BASELINE, GESCF_BASELINE, RGB_BASELINE,
                     CROSSATTN_BASELINE, VIEWDELTA_BASELINE, OFFICIAL_GESCF_BASELINE,
-                    SAM2_BASELINE, SAM3_BASELINE, DINOV3_SAM2_BASELINE, DINOV2_SAM2_BASELINE,
-                    DATASET_CHANGE_THRESHOLDS)
+                    SAM2_BASELINE, SAM3_BASELINE, DINOV3_SAM2_BASELINE, DINOV2_SAM2_BASELINE)
+from dinox_backend import dinox_change_mask
 
 DEFAULT_DATASET          = "new3"
 DEFAULT_CHANGE_THRESHOLD = 0.0   # metres — for GT mask derivation from depth diff
@@ -85,6 +87,11 @@ AVAILABLE_DATASETS = ['depth4', 'concrete1', 'test2', 'new0', 'new1', 'new2', 'n
 
 def load_exr_depth(exr_path, gt_to_cm=10000.0):
     """Load depth from EXR file, convert to metres."""
+    exr_cv = cv2.imread(os.fspath(exr_path), cv2.IMREAD_UNCHANGED)
+    if exr_cv is not None:
+        depth = exr_cv[..., 0] if exr_cv.ndim == 3 else exr_cv
+        return (depth.astype(np.float32) * gt_to_cm) / 100.0
+
     import OpenEXR, Imath
     exr_file = OpenEXR.InputFile(exr_path)
     header   = exr_file.header()
@@ -108,6 +115,11 @@ def load_exr_depth(exr_path, gt_to_cm=10000.0):
 # ---------------------------------------------------------------------------
 
 def load_exr_rgb(exr_path):
+    exr_cv = cv2.imread(os.fspath(exr_path), cv2.IMREAD_UNCHANGED)
+    if exr_cv is not None and exr_cv.ndim == 3 and exr_cv.shape[2] >= 3:
+        rgb = np.clip(exr_cv[..., :3][..., ::-1].astype(np.float32), 0, 1)
+        return Image.fromarray((rgb * 255).astype(np.uint8))
+
     import OpenEXR, Imath
     exr = OpenEXR.InputFile(exr_path)
     dw  = exr.header()['dataWindow']
@@ -905,6 +917,18 @@ def main():
     p.add_argument('--dinov3-sigma',     type=int,   default=DINOV3_BASELINE['sigma'])
     p.add_argument('--dinov3-min-area',  type=int,   default=DINOV3_BASELINE['min_area'])
     p.add_argument('--dinov3-dilate',    type=int,   default=DINOV3_BASELINE['dilate_iter'])
+    p.add_argument('--dinox-model', default=DINOX_BASELINE['model_name'],
+                   help='DINO-X API model name (default: DINO-X-1.0)')
+    p.add_argument('--dinox-token-env', default=DINOX_BASELINE['token_env'],
+                   help='Environment variable holding the DINO-X API token')
+    p.add_argument('--dinox-text-prompt', default=DINOX_BASELINE['text_prompt'],
+                   help='Optional DINO-X text prompt. Leave unset for prompt-free detection.')
+    p.add_argument('--dinox-bbox-threshold', type=float, default=DINOX_BASELINE['bbox_threshold'])
+    p.add_argument('--dinox-iou-threshold',  type=float, default=DINOX_BASELINE['iou_threshold'])
+    p.add_argument('--dinox-match-iou',      type=float, default=DINOX_BASELINE['match_iou'],
+                   help='IoU required to match same-category objects across the original and edited images')
+    p.add_argument('--dinox-min-area',       type=int,   default=DINOX_BASELINE['min_area'])
+    p.add_argument('--dinox-dilate',         type=int,   default=DINOX_BASELINE['dilate_iter'])
     p.add_argument('--ogescf-points',     type=int,   default=OFFICIAL_GESCF_BASELINE['points_per_side'])
     p.add_argument('--ogescf-iou',        type=float, default=OFFICIAL_GESCF_BASELINE['pred_iou_thresh'])
     p.add_argument('--ogescf-stability',  type=float, default=OFFICIAL_GESCF_BASELINE['stability_score_thresh'])
@@ -919,11 +943,11 @@ def main():
                    help='SAM 3 Gemma 4 VLM for auto prompt generation '
                         '(e.g. google/gemma-4-E2B-it)')
     p.add_argument('--models', nargs='+',
-                   choices=['rgb', 'dinov2', 'dinov3', 'gescf', 'ogescf',
+                   choices=['rgb', 'dinov2', 'dinov3', 'dinox', 'gescf', 'ogescf',
                             'viewdelta', 'crossattn', 'sam2', 'sam3', 'dinov3_sam2', 'dinov2_sam2'],
                    default=['rgb', 'dinov2', 'dinov3', 'gescf', 'ogescf', 'viewdelta', 'crossattn'],
                    metavar='MODEL',
-                   help='Models to run. Choices: rgb dinov2 dinov3 gescf ogescf viewdelta crossattn sam2 sam3 dinov3_sam2 dinov2_sam2. '
+                   help='Models to run. Choices: rgb dinov2 dinov3 dinox gescf ogescf viewdelta crossattn sam2 sam3 dinov3_sam2 dinov2_sam2. '
                         'SAM checkpoint paths are configured in params.py.')
     p.add_argument('--no-show',        action='store_true')
     p.add_argument('--masks-only',     action='store_true',
@@ -935,10 +959,12 @@ def main():
                    help='Path to edited GT depth EXR (for GT mask derivation)')
     p.add_argument('--change-threshold', type=float, default=None,
                    help='Depth diff threshold (m) to derive GT change mask '
-                        '(default: per-dataset value from DATASET_CHANGE_THRESHOLDS in params.py)')
+                        '(default: per-dataset value from data/<dataset>/params.json)')
     args = p.parse_args()
     if args.change_threshold is None:
-        args.change_threshold = DATASET_CHANGE_THRESHOLDS.get(args.dataset, DEFAULT_CHANGE_THRESHOLD)
+        _pf = os.path.join(PROJECT_ROOT, "data", args.dataset, "params.json")
+        _cp = json.load(open(_pf)) if os.path.exists(_pf) else {}
+        args.change_threshold = _cp.get('change_threshold_m', DEFAULT_CHANGE_THRESHOLD)
 
     data_dir = os.path.join(PROJECT_ROOT, "data", args.dataset)
     out_dir  = os.path.join(OUTPUT_ROOT, args.dataset)
@@ -1063,6 +1089,33 @@ def main():
                              "DINOv3", out_dir, args.dataset, vmax=0.5)
         except Exception as e:
             print(f"  ERROR: {e}")
+
+    # ── DINO-X ───────────────────────────────────────────────────────────────
+    if 'dinox' in run:
+        print("\n--- DINO-X ---")
+        try:
+            dinox_mask, dinox_diff = dinox_change_mask(
+                original_img,
+                edited_img,
+                token_env=args.dinox_token_env,
+                model_name=args.dinox_model,
+                prompt_text=args.dinox_text_prompt,
+                bbox_threshold=args.dinox_bbox_threshold,
+                iou_threshold=args.dinox_iou_threshold,
+                match_iou=args.dinox_match_iou,
+                min_area=args.dinox_min_area,
+                dilate_iter=args.dinox_dilate,
+            )
+            prompt_mode = "prompt-free" if not args.dinox_text_prompt else "text-prompted"
+            print(
+                f"  model={args.dinox_model}  mode={prompt_mode}  "
+                f"changed={dinox_mask.mean()*100:.2f}%"
+            )
+            results['DINO-X'] = {'mask': dinox_mask, 'diff_map': dinox_diff}
+            _save_method_png(original_img, edited_img, dinox_diff, dinox_mask,
+                             "DINO-X", out_dir, args.dataset, vmax=1.0)
+        except Exception as e:
+            print(f"  SKIPPED: {e}")
 
     # ── GeSCF ────────────────────────────────────────────────────────────────
     if 'gescf' in run:

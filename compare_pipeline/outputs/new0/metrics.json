@@ -1,0 +1,167 @@
+{
+  "dinov2__da3_giant": {
+    "mask_model": "dinov2",
+    "depth_model": "da3_giant",
+    "dataset": "new0",
+    "change_threshold_m": 0.06,
+    "changed": {
+      "n": 72818,
+      "mae": 0.04734375327825546,
+      "rmse": 0.09913605451583862,
+      "d1": 0.9978988711582301,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "unchanged": {
+      "n": 1236490,
+      "mae": 0.023412685841321945,
+      "rmse": 0.07980330288410187,
+      "d1": 0.9996304054217988,
+      "d2": 0.9997355417350726,
+      "d3": 1.0
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 1145124,
+      "fit_pixels_final": 1145124,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.12539753824157493,
+    "gt_changed_frac": 0.05561563818444552,
+    "mask_wall_s": 6.71,
+    "depth_wall_s": 60.6
+  },
+  "dinov2__dpro": {
+    "mask_model": "dinov2",
+    "depth_model": "dpro",
+    "dataset": "new0",
+    "change_threshold_m": 0.06,
+    "changed": {
+      "n": 72818,
+      "mae": 0.10483548790216446,
+      "rmse": 0.1429012566804886,
+      "d1": 0.9998764041857783,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "unchanged": {
+      "n": 1236490,
+      "mae": 0.047181256115436554,
+      "rmse": 0.0833912193775177,
+      "d1": 0.999877880128428,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 1145124,
+      "fit_pixels_final": 1145124,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.12539753824157493,
+    "gt_changed_frac": 0.05561563818444552,
+    "mask_wall_s": 6.69,
+    "depth_wall_s": 14.94
+  },
+  "dinov2__moge2": {
+    "mask_model": "dinov2",
+    "depth_model": "moge2",
+    "dataset": "new0",
+    "change_threshold_m": 0.06,
+    "changed": {
+      "n": 72818,
+      "mae": 0.0817754790186882,
+      "rmse": 0.13471385836601257,
+      "d1": 0.9991348293004477,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "unchanged": {
+      "n": 1236490,
+      "mae": 0.07563909143209457,
+      "rmse": 0.11524252593517303,
+      "d1": 0.9996845910601784,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 1145124,
+      "fit_pixels_final": 1145124,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.12539753824157493,
+    "gt_changed_frac": 0.05561563818444552,
+    "mask_wall_s": 6.74,
+    "depth_wall_s": 6.92
+  },
+  "dinov2__unidepth_vitl": {
+    "mask_model": "dinov2",
+    "depth_model": "unidepth_vitl",
+    "dataset": "new0",
+    "change_threshold_m": 0.06,
+    "changed": {
+      "n": 72818,
+      "mae": 0.06880929321050644,
+      "rmse": 0.09510022401809692,
+      "d1": 1.0,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "unchanged": {
+      "n": 1236490,
+      "mae": 0.06640329211950302,
+      "rmse": 0.10545440763235092,
+      "d1": 0.9996481977209682,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "fit_info": {
+      "fit_strategy": "ls_trimmed",
+      "fit_pixels_initial": 1145124,
+      "fit_pixels_final": 1087867,
+      "fit_trim_keep_percent": 95.0,
+      "fit_trim_applied": true
+    },
+    "pred_changed_frac": 0.12539753824157493,
+    "gt_changed_frac": 0.05561563818444552,
+    "mask_wall_s": 6.78,
+    "depth_wall_s": 10.24
+  },
+  "dinov2__unik3d": {
+    "mask_model": "dinov2",
+    "depth_model": "unik3d",
+    "dataset": "new0",
+    "change_threshold_m": 0.06,
+    "changed": {
+      "n": 72818,
+      "mae": 0.050203241407871246,
+      "rmse": 0.07634265720844269,
+      "d1": 0.9999313356587657,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "unchanged": {
+      "n": 1236490,
+      "mae": 0.06056266278028488,
+      "rmse": 0.0836871862411499,
+      "d1": 0.9998050934500077,
+      "d2": 1.0,
+      "d3": 1.0
+    },
+    "fit_info": {
+      "fit_strategy": "ls",
+      "fit_pixels_initial": 1145124,
+      "fit_pixels_final": 1145124,
+      "fit_trim_keep_percent": null,
+      "fit_trim_applied": false
+    },
+    "pred_changed_frac": 0.12539753824157493,
+    "gt_changed_frac": 0.05561563818444552,
+    "mask_wall_s": 6.67,
+    "depth_wall_s": 10.42
+  }
+}

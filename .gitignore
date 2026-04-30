@@ -52,3 +52,7 @@ _ul
 
 # Local settings
 .claude/
+.vscode/
+.env
+.env.*
+!.env.example

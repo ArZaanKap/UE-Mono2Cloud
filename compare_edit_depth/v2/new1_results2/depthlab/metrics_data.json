@@ -1,0 +1,36 @@
+{
+  "depthlab": {
+    "scale": 1.0,
+    "shift": 0.0,
+    "scaling": "depthlab",
+    "change_threshold_m": 0.05,
+    "gt_changed_frac": 0.08867814143043501,
+    "edit_unchanged": {
+      "n": 1193201,
+      "mae": 0.02424921840429306,
+      "rmse": 0.05305451899766922,
+      "d1": 0.9998918874523236,
+      "d2": 1.0,
+      "d3": 1.0,
+      "sna_mean": NaN,
+      "sna_median": NaN,
+      "pct_11": NaN,
+      "pct_22": NaN,
+      "pct_30": NaN
+    },
+    "edit_changed": {
+      "n": 116107,
+      "mae": 0.21005970239639282,
+      "rmse": 0.3075452744960785,
+      "d1": 0.9841783871773451,
+      "d2": 0.9975712058704471,
+      "d3": 1.0,
+      "sna_mean": NaN,
+      "sna_median": NaN,
+      "pct_11": NaN,
+      "pct_22": NaN,
+      "pct_30": NaN
+    },
+    "guidance_pixels": 1193201
+  }
+}

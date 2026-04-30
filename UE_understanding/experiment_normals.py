@@ -369,14 +369,14 @@ def main():
 
     for dataset in args.datasets:
         folder  = os.path.join(PROJECT_ROOT, "data", dataset)
-        cp_path = os.path.join(folder, "camera_params.json")
+        cp_path = os.path.join(folder, "params.json")
         if not os.path.exists(cp_path):
-            print(f"  Skipping {dataset}: no camera_params.json")
+            print(f"  Skipping {dataset}: no params.json")
             continue
         with open(cp_path) as f:
             cp = json.load(f)
         if any(cp.get(k) is None for k in ('fov_deg','pitch_deg','yaw_deg','roll_deg')):
-            print(f"  Skipping {dataset}: camera_params.json incomplete")
+            print(f"  Skipping {dataset}: params.json incomplete")
             continue
 
         print(f"\n=== {dataset} (image {args.image}) ===")

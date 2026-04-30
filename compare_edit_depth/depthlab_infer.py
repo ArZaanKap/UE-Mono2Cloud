@@ -53,6 +53,9 @@ def main():
     parser.add_argument('--depthlab-dir',   required=True)
     parser.add_argument('--denoise-steps',  type=int, default=20)
     parser.add_argument('--processing-res', type=int, default=0)
+    parser.add_argument('--strength',       type=float, default=1.0)
+    parser.add_argument('--normalize-scale', type=float, default=1.0)
+    parser.add_argument('--no-blend',       action='store_true')
     args = parser.parse_args()
 
     depthlab_dir = os.path.abspath(args.depthlab_dir)
@@ -146,9 +149,9 @@ def main():
             depth_numpy_origin = depth_numpy,
             mask_origin        = mask,
             guidance_scale     = 1,
-            normalize_scale    = 1,
-            strength           = 0.8,
-            blend              = True,
+            normalize_scale    = args.normalize_scale,
+            strength           = args.strength,
+            blend              = not args.no_blend,
         )
 
     depth_pred = pipe_out.depth_np

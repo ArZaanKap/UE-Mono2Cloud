@@ -8,13 +8,14 @@ This folder contains the script for comparing change detection methods, and the 
 
 Given an original UE render and a user-edited version, we need to know **which pixels changed** so we can calibrate depth only on the parts of the scene that stayed the same.
 
-Seven methods are compared side-by-side:
+Eight methods are compared side-by-side:
 
 | Method | How it works |
 |---|---|
 | **RGB threshold** | Pixel-level colour difference > threshold |
 | **DINOv2** | Feature distance on 37×37 patch grid (518×518 input, 4 layers concat) |
 | **DINOv3** | Updated DINOv3 feature baseline |
+| **DINO-X** | API-backed object detection/segmentation; unmatched objects across original and edited are treated as changes |
 | **GeSCF** | SAM ViT-B block 8 attention features, adaptive threshold (mean + k·std where k = clip(skewness, 1, 3)) |
 | **Official GeSCF** | Official pretrained GeSCF weights from `mask_models/gescf-official/` |
 | **ViewDelta** | From vendored `mask_models/viewdelta-scd/` |
@@ -31,6 +32,9 @@ For pair datasets (`new*`), a **GT mask** derived from `|depth_gt_edit − depth
 ```bash
 # Run all methods on a dataset and save results
 python change_detection_results/test_change_detection.py --dataset new0
+
+# Run the optional DINO-X baseline (requires DINOX_API_TOKEN in your environment)
+python change_detection_results/test_change_detection.py --dataset new4 --models dinox
 
 # Skip expensive baselines
 python change_detection_results/test_change_detection.py --dataset new4 --skip-dino --skip-crossattn
@@ -87,4 +91,5 @@ being stored as a separate `.npy` dependency.
 
 - Masks are pre-computed once and reused across depth experiments — you don't need to re-run unless you change the dataset or method.
 - The cross-attention baseline requires the vendored `Robust-Scene-Change-Detection` repo; the others have no extra dependencies beyond the main `requirements.txt`.
+- The DINO-X baseline is API-backed and expects a token in `DINOX_API_TOKEN` unless you override `--dinox-token-env`.
 - `gt_mask_comparison.ipynb` — interactive notebook comparing predicted masks against the GT depth-diff mask across all pair datasets.

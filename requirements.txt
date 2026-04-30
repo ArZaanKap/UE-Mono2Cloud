@@ -28,5 +28,6 @@ depth-pro==0.1
 segment-anything
 einops
 requests
+dds-cloudapi-sdk>=0.5.3
 pyyaml
 jupyter

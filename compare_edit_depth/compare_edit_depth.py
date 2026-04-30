@@ -10,7 +10,7 @@ GT change mask is derived from |depth_gt_edit − depth_gt_orig| > threshold and
 saved as a PNG so you can visually verify it is correct.
 
 Args:
-    --model             dpro | da3_giant | da3_nested          (default: dpro)
+    --model             dpro | da3_giant | da3_nested | unidepth_vitl | promptda_vitl | moge2 | unik3d | hyden  (default: dpro)
     --dataset           new0 | new1 | depth4 | concrete1 | test2  (default: new0)
     --scaling           ls | median                              (default: ls)
     --change-threshold  float in metres                          (default: 0.03)
@@ -52,14 +52,20 @@ PROJECT_ROOT   = os.path.dirname(SCRIPT_DIR)
 OUTPUT_FOLDER  = os.path.join(SCRIPT_DIR, "v1")
 GT_TO_CENTIMETERS        = 10000.0
 DEFAULT_CHANGE_THRESHOLD = 0.0   # metres
+UNIDEPTH_TRIM_KEEP_PERCENT = 95.0
 
 AVAILABLE_DATASETS = ['new0', 'new1', 'new2', 'new3', 'new4']
 DEFAULT_DATASET          = 'new0'
 
 AVAILABLE_MODELS = {
-    'da3_giant':  'DA3 Giant 1.1',
-    'da3_nested': 'DA3 Nested Giant 1.1',
-    'dpro':       'Depth Pro',
+    'da3_giant':     'DA3 Giant 1.1',
+    'da3_nested':    'DA3 Nested Giant 1.1',
+    'dpro':          'Depth Pro',
+    'unidepth_vitl': 'UniDepth-V2 ViT-L',
+    'promptda_vitl': 'PromptDA ViT-L',
+    'moge2':         'MoGe-2 ViT-L',
+    'unik3d':        'UniK3D ViT-L',
+    'hyden':         'HyDen DA2-Large',
 }
 
 DA3_HF_MODELS = {
@@ -70,6 +76,11 @@ DA3_HF_MODELS = {
 DA3_MODEL_NAMES = {
     'da3_giant':  'da3-giant',
     'da3_nested': 'da3nested-giant-large',
+}
+
+DA3_DEFAULT_PROCESS_RES = {
+    'da3_giant':  0,     # native (~1526px)
+    'da3_nested': 1024,
 }
 
 
@@ -162,9 +173,12 @@ def find_files(folder):
 # Model inference (subprocess)
 # ---------------------------------------------------------------------------
 
-def run_model_subprocess(model_name, rgb_path, output_path):
+def run_model_subprocess(model_name, rgb_path, output_path, da3_process_res=None,
+                         moge2_fov_x=None, moge2_num_tokens=None, moge2_fp32=False):
     rgb_path_safe    = rgb_path.replace('\\', '/')
     output_path_safe = output_path.replace('\\', '/')
+    if da3_process_res is None:
+        da3_process_res = DA3_DEFAULT_PROCESS_RES.get(model_name, 1024)
 
     exr_loader = '''
 def load_exr_rgb(path):
@@ -223,12 +237,14 @@ with safe_open(model_file, framework="pt", device="cpu") as h:
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
 img = load_image("{rgb_path_safe}")
+_proc_res = max(img.size) if {da3_process_res} <= 0 else {da3_process_res}
 with torch.no_grad():
-    prediction = da3_model.inference([img])
+    prediction = da3_model.inference([img], process_res=_proc_res)
 depth = prediction.depth[0]
 np.save("{output_path_safe}", depth)
 print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
 '''
+
 
     elif model_name == 'dpro':
         depth_pro_checkpoint = os.path.join(PROJECT_ROOT, "depth_models", "checkpoints", "depth_pro.pt").replace('\\', '/')
@@ -250,6 +266,147 @@ img = load_image("{rgb_path_safe}")
 image_tensor = transform(img).to(device)
 prediction = model.infer(image_tensor, f_px=None)
 depth = prediction["depth"].cpu().numpy().squeeze()
+np.save("{output_path_safe}", depth)
+print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
+'''
+    elif model_name == 'unidepth_vitl':
+        script = f'''
+import torch, numpy as np
+from PIL import Image
+torch.set_grad_enabled(False)
+{exr_loader}
+from unidepth.models import UniDepthV2
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = UniDepthV2.from_pretrained("lpiccinelli/unidepth-v2-vitl14")
+model = model.to(device).eval()
+img = load_image("{rgb_path_safe}")
+rgb_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float().to(device)
+with torch.no_grad():
+    predictions = model.infer(rgb_tensor)
+depth = predictions["depth"].squeeze().cpu().numpy()
+np.save("{output_path_safe}", depth)
+print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
+'''
+    elif model_name == 'promptda_vitl':
+        script = f'''
+import torch, numpy as np
+from PIL import Image
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+torch.set_grad_enabled(False)
+{exr_loader}
+device = "cuda" if torch.cuda.is_available() else "cpu"
+processor = AutoImageProcessor.from_pretrained("depth-anything/prompt-depth-anything-vitl-hf")
+model = AutoModelForDepthEstimation.from_pretrained("depth-anything/prompt-depth-anything-vitl-hf")
+model = model.to(device).eval()
+img = load_image("{rgb_path_safe}")
+inputs = processor(images=img, return_tensors="pt").to(device)
+with torch.no_grad():
+    outputs = model(**inputs)
+post = processor.post_process_depth_estimation(outputs, target_sizes=[(img.height, img.width)])
+depth = post[0]["predicted_depth"].cpu().numpy()
+np.save("{output_path_safe}", depth)
+print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
+'''
+    elif model_name == 'unik3d':
+        script = f'''
+import warnings
+warnings.filterwarnings("ignore")
+import torch, numpy as np
+from PIL import Image
+torch.set_grad_enabled(False)
+{exr_loader}
+from unik3d.models import UniK3D
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = UniK3D.from_pretrained("lpiccinelli/unik3d-vitl")
+model.resolution_level = 9
+model.interpolation_mode = "bilinear"
+model = model.to(device).eval()
+img = load_image("{rgb_path_safe}")
+rgb = torch.from_numpy(np.array(img)).permute(2, 0, 1)
+with torch.no_grad():
+    out = model.infer(rgb, normalize=True)
+depth = out["depth"].squeeze().cpu().numpy()
+np.save("{output_path_safe}", depth)
+print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
+'''
+    elif model_name == 'moge2':
+        _fov_arg       = repr(moge2_fov_x)        # 'None' or a float literal
+        _tokens_arg    = repr(moge2_num_tokens)    # 'None' or an int literal
+        _use_fp16_arg  = repr(not moge2_fp32)
+        script = f'''
+import torch, numpy as np
+from PIL import Image
+torch.set_grad_enabled(False)
+{exr_loader}
+from moge.model.v2 import MoGeModel
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = MoGeModel.from_pretrained("Ruicheng/moge-2-vitl").to(device).eval()
+img = load_image("{rgb_path_safe}")
+rgb_tensor = torch.tensor(np.array(img) / 255.0, dtype=torch.float32, device=device).permute(2, 0, 1)
+with torch.no_grad():
+    output = model.infer(rgb_tensor, fov_x={_fov_arg}, num_tokens={_tokens_arg}, use_fp16={_use_fp16_arg})
+depth = output["depth"].cpu().numpy()
+np.save("{output_path_safe}", depth)
+print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
+'''
+    elif model_name == 'hyden':
+        metadepth_parent = os.path.join(PROJECT_ROOT, "depth_models").replace('\\', '/')
+        script = f'''
+import sys, torch, numpy as np
+from pathlib import Path
+from PIL import Image
+from torchvision import transforms
+from huggingface_hub import hf_hub_download
+torch.set_grad_enabled(False)
+{exr_loader}
+metadepth_parent = Path(r"{metadepth_parent}")
+if str(metadepth_parent) not in sys.path:
+    sys.path.insert(0, str(metadepth_parent))
+from metadepth.da2 import HyDenDepthAnything
+device = "cuda" if torch.cuda.is_available() else "cpu"
+repo_id = "facebook/hyden-da2-relative-depth"
+filename = "hyden_da2_reldepth_vitl_fp32_f809396504.pth"
+try:
+    ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename, local_files_only=True)
+except Exception:
+    ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
+model = HyDenDepthAnything(encoder="vitl")
+ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+ckpt = {{k.removeprefix("module."): v for k, v in ckpt.items()}}
+ckpt.pop("pretrained.mask_token", None)
+metanet_keys = [k for k in ckpt if k.startswith("metanet_encoder.")]
+if metanet_keys:
+    model_state = model.state_dict()
+    cnn_keys = [k for k in model_state if k.startswith("cnn_encoder.")]
+    if len(metanet_keys) != len(cnn_keys):
+        raise RuntimeError(
+            f"HyDen checkpoint mismatch: {{len(metanet_keys)}} metanet tensors for "
+            f"{{len(cnn_keys)}} cnn tensors"
+        )
+    for src_key, dst_key in zip(metanet_keys, cnn_keys):
+        if ckpt[src_key].shape != model_state[dst_key].shape:
+            raise RuntimeError(
+                f"HyDen tensor shape mismatch: {{src_key}} {{tuple(ckpt[src_key].shape)}} "
+                f"-> {{dst_key}} {{tuple(model_state[dst_key].shape)}}"
+            )
+        ckpt[dst_key] = ckpt.pop(src_key)
+missing, unexpected = model.load_state_dict(ckpt, strict=False)
+if missing or unexpected:
+    raise RuntimeError(
+        f"HyDen checkpoint load mismatch. Missing={{missing[:10]}} "
+        f"(total={{len(missing)}}), unexpected={{unexpected[:10]}} "
+        f"(total={{len(unexpected)}})"
+    )
+model = model.to(device).eval()
+transform = transforms.Compose([
+    transforms.Resize((518, 518)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+img = load_image("{rgb_path_safe}")
+with torch.no_grad():
+    depth = model(transform(img).unsqueeze(0).to(device))
+depth = depth.squeeze().cpu().numpy()
 np.save("{output_path_safe}", depth)
 print(f"OK: shape={{depth.shape}}, range={{depth.min():.2f}}-{{depth.max():.2f}}")
 '''
@@ -290,6 +447,91 @@ def compute_depth_metrics(pred, gt, mask):
         d2   = float(np.mean(ratio < 1.25 ** 2)),
         d3   = float(np.mean(ratio < 1.25 ** 3)),
     )
+
+
+def fit_depth_alignment(pred, gt, mask, scaling_method='ls', trim_keep_percent=None):
+    """Fit scale/shift on valid pixels, with optional residual trimming for LS."""
+    valid = (
+        mask
+        & (gt > 0.1) & (gt < 100)
+        & np.isfinite(pred) & np.isfinite(gt)
+    )
+    if valid.sum() == 0:
+        raise ValueError("No valid pixels available for depth alignment")
+
+    p_fit = pred[valid].reshape(-1)
+    g_fit = gt[valid].reshape(-1)
+    fit_info = {
+        'fit_strategy': scaling_method,
+        'fit_pixels_initial': int(valid.sum()),
+        'fit_pixels_final': int(valid.sum()),
+        'fit_trim_keep_percent': None,
+        'fit_trim_applied': False,
+    }
+
+    if scaling_method == 'median':
+        scale = float(np.median(g_fit) / np.median(p_fit))
+        shift = 0.0
+        return scale, shift, fit_info
+
+    A = np.vstack([p_fit, np.ones_like(p_fit)]).T
+    scale, shift = [float(x) for x in np.linalg.lstsq(A, g_fit, rcond=None)[0]]
+
+    if trim_keep_percent is None or not (0.0 < trim_keep_percent < 100.0):
+        return scale, shift, fit_info
+
+    residual = np.abs((pred * scale + shift) - gt)
+    trim_threshold = float(np.percentile(residual[valid], trim_keep_percent))
+    refined = valid & (residual <= trim_threshold)
+    if refined.sum() < 16:
+        return scale, shift, fit_info
+
+    p_ref = pred[refined].reshape(-1)
+    g_ref = gt[refined].reshape(-1)
+    A_ref = np.vstack([p_ref, np.ones_like(p_ref)]).T
+    scale, shift = [float(x) for x in np.linalg.lstsq(A_ref, g_ref, rcond=None)[0]]
+    fit_info.update({
+        'fit_strategy': 'ls_trimmed',
+        'fit_pixels_final': int(refined.sum()),
+        'fit_trim_keep_percent': float(trim_keep_percent),
+        'fit_trim_applied': True,
+    })
+    return scale, shift, fit_info
+
+
+def fit_metric_alignment(pred, gt, mask, scaling_method='ls', trim_keep_percent=None,
+                         alignment_domain='depth'):
+    """Fit in the requested alignment domain and return metric-depth mapping."""
+    if alignment_domain == 'depth':
+        return fit_depth_alignment(
+            pred, gt, mask,
+            scaling_method=scaling_method,
+            trim_keep_percent=trim_keep_percent,
+        )
+    if alignment_domain != 'disparity':
+        raise ValueError(f"Unsupported alignment domain: {alignment_domain}")
+
+    valid_disp = np.isfinite(gt) & (gt > 0.1)
+    gt_disp = np.zeros_like(gt, dtype=np.float32)
+    gt_disp[valid_disp] = 1.0 / gt[valid_disp]
+    scale, shift, fit_info = fit_depth_alignment(
+        pred, gt_disp, mask,
+        scaling_method=scaling_method,
+        trim_keep_percent=trim_keep_percent,
+    )
+    fit_info['fit_domain'] = 'disparity'
+    return scale, shift, fit_info
+
+
+def aligned_prediction_to_metric_depth(pred, scale, shift, scaling_method='ls',
+                                       alignment_domain='depth'):
+    """Apply fitted alignment and convert the prediction to metric depth."""
+    aligned = pred * scale if scaling_method == 'median' else pred * scale + shift
+    if alignment_domain == 'depth':
+        return aligned
+    if alignment_domain == 'disparity':
+        return 1.0 / np.clip(aligned, 1e-6, None)
+    raise ValueError(f"Unsupported alignment domain: {alignment_domain}")
 
 
 def _load_world_normal(path):
@@ -434,12 +676,24 @@ def main():
     parser.add_argument('--model', default='dpro', choices=list(AVAILABLE_MODELS.keys()))
     parser.add_argument('--scaling', default='ls', choices=['median', 'ls'])
     parser.add_argument('--dataset', default=DEFAULT_DATASET, choices=AVAILABLE_DATASETS)
-    parser.add_argument('--change-threshold', type=float, default=DEFAULT_CHANGE_THRESHOLD,
-                        help='Depth difference (m) to mark a pixel as changed')
+    parser.add_argument('--change-threshold', type=float, default=None,
+                        help='Depth difference (m) to mark a pixel as changed (default: from params.json)')
+    parser.add_argument('--unidepth-trim-keep-pct', type=float, default=UNIDEPTH_TRIM_KEEP_PERCENT,
+                        help='For UniDepth + least-squares only: refit after keeping this residual percentile '
+                             'of calibration pixels; 100 disables trimming')
+    parser.add_argument('--moge2-num-tokens', type=int, default=None,
+                        help='MoGe-2: number of ViT tokens (1200–2500); None = auto-max')
+    parser.add_argument('--moge2-fp32', action='store_true',
+                        help='MoGe-2: disable fp16 (marginal accuracy gain, more memory)')
     parser.add_argument('--no-show', action='store_true')
     parser.add_argument('--all-models', action='store_true',
                         help='Run all available models sequentially on the given dataset')
     args = parser.parse_args()
+
+    _pf = os.path.join(PROJECT_ROOT, "data", args.dataset, "params.json")
+    _cp0 = json.load(open(_pf)) if os.path.exists(_pf) else {}
+    if args.change_threshold is None:
+        args.change_threshold = _cp0.get('change_threshold_m', DEFAULT_CHANGE_THRESHOLD)
 
     if args.all_models:
         print("STARTING")
@@ -449,7 +703,8 @@ def main():
                    '--model', mk,
                    '--dataset', args.dataset,
                    '--scaling', args.scaling,
-                   '--change-threshold', str(args.change_threshold)]
+                   '--change-threshold', str(args.change_threshold),
+                   '--unidepth-trim-keep-pct', str(args.unidepth_trim_keep_pct)]
             if args.no_show:
                 cmd.append('--no-show')
             result = subprocess.run(cmd)
@@ -461,6 +716,7 @@ def main():
     model_key      = args.model
     model_name     = AVAILABLE_MODELS[model_key]
     scaling_method = args.scaling
+    alignment_domain = 'disparity' if model_key == 'hyden' else 'depth'
     scaling_folder = 'median' if scaling_method == 'median' else 'least_squares'
     scaling_prefix = 'med'   if scaling_method == 'median' else 'ls'
     dataset        = args.dataset
@@ -485,14 +741,14 @@ def main():
     H_gt, W_gt   = target_shape
 
     # ── Load camera params ───────────────────────────────────────────────────
-    cam_params_path = os.path.join(input_folder, "camera_params.json")
+    cam_params_path = os.path.join(input_folder, "params.json")
     cp = {}
     if os.path.exists(cam_params_path):
         with open(cam_params_path) as f:
             cp = json.load(f)
     _fov = cp.get('fov_deg') or 90.0
     if cp.get('fov_deg') is None:
-        print(f"  [warn] fov_deg not set in camera_params.json — assuming {_fov}°")
+        print(f"  [warn] fov_deg not set in params.json — assuming {_fov}°")
     _fx = (W_gt / 2.0) / np.tan(np.radians(_fov) / 2.0)
     _fy, _cx, _cy = _fx, W_gt / 2.0, H_gt / 2.0
 
@@ -519,11 +775,16 @@ def main():
                 gt_normals_orig = _load_world_normal(wn_orig)
 
     # ── Run model on both images ────────────────────────────────────────────
+    moge2_fov_x = float(_fov) if model_key == 'moge2' and cp.get('fov_deg') else None
+
     def _infer(img_path, label):
         with tempfile.NamedTemporaryFile(suffix='.npy', delete=False) as f:
             tmp = f.name
         try:
-            run_model_subprocess(model_key, img_path, tmp)
+            run_model_subprocess(model_key, img_path, tmp,
+                                 moge2_fov_x=moge2_fov_x,
+                                 moge2_num_tokens=args.moge2_num_tokens,
+                                 moge2_fp32=args.moge2_fp32)
             return np.load(tmp)
         finally:
             if os.path.exists(tmp):
@@ -545,23 +806,49 @@ def main():
         edited_img = edited_img.resize(original_img.size, Image.BILINEAR)
 
     # ── Scale fit on original image (all valid pixels vs depth_gt_orig) ─────
-    valid_for_fit = (
-        (depth_gt_orig > 0.1) & (depth_gt_orig < 100)
-        & np.isfinite(depth_original) & np.isfinite(depth_gt_orig)
+    trim_keep_percent = (
+        args.unidepth_trim_keep_pct
+        if model_key == 'unidepth_vitl' and scaling_method == 'ls'
+        else None
     )
-    p_fit = depth_original[valid_for_fit].flatten()
-    g_fit = depth_gt_orig[valid_for_fit].flatten()
+    scale, shift, fit_info = fit_metric_alignment(
+        depth_original,
+        depth_gt_orig,
+        np.isfinite(depth_gt_orig),
+        scaling_method=scaling_method,
+        trim_keep_percent=trim_keep_percent,
+        alignment_domain=alignment_domain,
+    )
 
-    if scaling_method == 'median':
-        scale = float(np.median(g_fit) / np.median(p_fit))
-        shift = 0.0
-    else:
-        A = np.vstack([p_fit, np.ones_like(p_fit)]).T
-        scale, shift = [float(x) for x in np.linalg.lstsq(A, g_fit, rcond=None)[0]]
-
-    depth_original_scaled = depth_original * scale + shift
-    depth_edited_scaled   = depth_edited   * scale + shift
+    depth_original_scaled = aligned_prediction_to_metric_depth(
+        depth_original,
+        scale,
+        shift,
+        scaling_method=scaling_method,
+        alignment_domain=alignment_domain,
+    )
+    depth_edited_scaled = aligned_prediction_to_metric_depth(
+        depth_edited,
+        scale,
+        shift,
+        scaling_method=scaling_method,
+        alignment_domain=alignment_domain,
+    )
     print(f"\nScale fit on original (all pixels): scale={scale:.4f}, shift={shift:.4f} m")
+    if fit_info.get('fit_trim_applied'):
+        print(
+            "  UniDepth robust refit:"
+            f" kept {fit_info['fit_pixels_final']:,}/{fit_info['fit_pixels_initial']:,}"
+            f" calibration pixels ({fit_info['fit_trim_keep_percent']:.1f}th residual percentile)"
+        )
+
+    # For metric models, also evaluate raw (unscaled) output to test absolute accuracy
+    raw_unch_m = raw_ch_m = None
+    if model_key == 'unidepth_vitl':
+        raw_unch_m = compute_depth_metrics(depth_edited, depth_gt_edit, gt_unchanged)
+        raw_ch_m   = compute_depth_metrics(depth_edited, depth_gt_edit, gt_changed)
+        print(f"  raw (no scale): unch MAE={raw_unch_m['mae']:.4f}m  ch MAE={raw_ch_m['mae']:.4f}m  "
+              f"(scale={scale:.4f}, shift={shift:.4f})")
 
     # ── Metrics ──────────────────────────────────────────────────────────────
     orig_unch  = compute_depth_metrics(depth_original_scaled, depth_gt_orig,  gt_unchanged)
@@ -582,7 +869,7 @@ def main():
     print("\n" + "=" * 75)
     print("METRICS")
     print("=" * 75)
-    print(f"{'Region':<22} {'n':>8} {'MAE (m)':>10} {'RMSE (m)':>10} {'δ1':>8} {'δ2':>8} {'δ3':>8} {'SNA(°)':>8}")
+    print(f"{'Region':<22} {'n':>8} {'MAE (m)':>10} {'RMSE (m)':>10} {'d1':>8} {'d2':>8} {'d3':>8} {'SNA(deg)':>8}")
     print("-" * 75)
     for label, m, sna in [
         ("orig vs GT_orig (unch)", orig_unch, sna_orig_unch),
@@ -602,12 +889,17 @@ def main():
         all_metrics = {}
 
     all_metrics[model_key] = {
+        'model_key': model_key,
         'scale': scale, 'shift': shift,
+        'alignment_domain': alignment_domain,
+        **fit_info,
         'change_threshold_m': args.change_threshold,
         'gt_changed_frac': float(gt_changed.mean()),
         'orig_unchanged': {**orig_unch, **sna_orig_unch},
         'edit_unchanged': {**unch_m,    **sna_unch},
         'edit_changed':   {**ch_m,      **sna_ch},
+        **({'raw_edit_unchanged': raw_unch_m, 'raw_edit_changed': raw_ch_m}
+           if raw_unch_m is not None else {}),
     }
 
     with open(metrics_json_path, 'w') as f:
@@ -619,8 +911,9 @@ def main():
     fig, axes = plt.subplots(2, 4, figsize=(22, 9))
     plt.subplots_adjust(hspace=0.18, wspace=0.06)
 
-    vmin_d = min(depth_gt_orig.min(), depth_gt_edit.min())
-    vmax_d = max(depth_gt_orig.max(), depth_gt_edit.max())
+    _both_valid = np.concatenate([depth_gt_orig[depth_gt_orig > 0], depth_gt_edit[depth_gt_edit > 0]])
+    vmin_d = float(_both_valid.min())
+    vmax_d = float(_both_valid.max())
 
     # Row 0: Original, Edited, orig pred scaled, edit pred scaled
     axes[0, 0].imshow(original_img)
@@ -642,7 +935,11 @@ def main():
     axes[1, 0].set_title('GT Depth (Edit)', fontsize=11); axes[1, 0].axis('off')
     plt.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04, label='m')
 
-    axes[1, 1].imshow(gt_changed.astype(np.uint8), cmap='RdYlGn_r')
+    _overlay = np.zeros((*gt_changed.shape, 4), dtype=np.float32)
+    _overlay[gt_changed]  = [1, 0, 0, 0.55]
+    _overlay[~gt_changed] = [0, 1, 0, 0.15]
+    axes[1, 1].imshow(edited_img)
+    axes[1, 1].imshow(_overlay)
     axes[1, 1].set_title(
         f'GT Change Mask\n{gt_changed.mean()*100:.1f}% changed  (thr={args.change_threshold}m)',
         fontsize=11)
